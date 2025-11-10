@@ -1,7 +1,7 @@
 
 
 ---------------------- НАСТРОЙКИ ----------------------
-local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"   -- <== ВСТАВЬ сюда свой raw URL (иначе Auto Inject ничего не загрузит)
+local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
 local DEFAULT_HOTKEY  = Enum.KeyCode.K
 -------------------------------------------------------
 
