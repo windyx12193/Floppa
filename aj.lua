@@ -1,15 +1,7 @@
---[[
-  FLOPPA AUTO JOINER - Glass/Blur UI (Roblox Lua) v4.1
-  • FIX: Auto Inject с вшитым URL (не зависит от getgenv в новом сервере).
-  • FIX: Убраны все мелкие подсказки "пример: ...".
-  • Сохранено: лёгкий блюр, фиолетовая тема, скроллы, ребайнд хоткея (клик по плашке).
-  ---------------------------------------------------------------------------
-  ОБЯЗАТЕЛЬНО: укажи ссылку на свой скрипт, который нужно переинжектить.
-  Пример:  local AUTO_INJECT_URL = "https://raw.githubusercontent.com/user/repo/main/floppa.lua"
-]]
+
 
 ---------------------- НАСТРОЙКИ ----------------------
-local AUTO_INJECT_URL = ""   -- <== ВСТАВЬ сюда свой raw URL (иначе Auto Inject ничего не загрузит)
+local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/aj.lua"   -- <== ВСТАВЬ сюда свой raw URL (иначе Auto Inject ничего не загрузит)
 local DEFAULT_HOTKEY  = Enum.KeyCode.K
 -------------------------------------------------------
 
