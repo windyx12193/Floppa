@@ -1,9 +1,9 @@
 --[[
-  FLOPPA AUTO JOINER - Luau-safe v4.6 (with JSON config)
-  • Горячая клавиша фиксирована: T (англ.), ребинда нет
-  • Надёжный авто-реинжект: только queue_on_teleport (без "run now")
-  • Bootstrap ждёт game:IsLoaded() и LocalPlayer, сбрасывает __FLOPPA_UI_ACTIVE → без дублей и крашей
-  • Сохранение настроек (кроме хоткея) в JSON, если writefile/readfile доступны
+  FLOPPA AUTO JOINER - Luau-safe v4.7 (JSON-first init)
+  • Хоткей фикс.: T
+  • queue_on_teleport bootstrap (без run-now), сброс __FLOPPA_UI_ACTIVE
+  • Конфиг JSON читается ДО создания UI → тумблеры/поля рисуются сразу правильно
+  • Финальный refreshUI() после показа окна
 ]]
 
 ------------------ USER SETTINGS ------------------
@@ -12,8 +12,13 @@ local FIXED_HOTKEY    = Enum.KeyCode.T
 local SETTINGS_PATH   = "floppa_aj_settings.json"
 ---------------------------------------------------
 
--- === FS helpers ===
-local HttpService = game:GetService("HttpService")
+-- === Services & FS ===
+local Players      = game:GetService("Players")
+local UIS          = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Lighting     = game:GetService("Lighting")
+local HttpService  = game:GetService("HttpService")
+
 local function hasFS()
     return typeof(writefile)=="function" and typeof(readfile)=="function" and typeof(isfile)=="function"
 end
@@ -32,8 +37,7 @@ local function loadJSON(path)
     return tbl
 end
 
--- === Singleton-friendly очистка ===
-local Players = game:GetService("Players")
+-- === Singleton-friendly очистка старого GUI ===
 local function findGuiParent()
     local okH, hui = pcall(function() return gethui and gethui() end)
     if okH and hui then return hui end
@@ -48,16 +52,31 @@ do
         if old then pcall(function() old:Destroy() end) end
     end
     local G = (getgenv and getgenv()) or _G
-    G.__FLOPPA_UI_ACTIVE = true -- информативно
+    G.__FLOPPA_UI_ACTIVE = true
 end
 
--- === Services ===
-local UIS          = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local Lighting     = game:GetService("Lighting")
-local player       = Players.LocalPlayer
+-- === СНАЧАЛА загружаем конфиг ===
+local State = {
+    AutoJoin      = false,
+    AutoInject    = false,
+    IgnoreEnabled = false,
+    JoinRetry     = 50,
+    MinMS         = 100,
+    IgnoreNames   = {}
+}
+do
+    local cfg = loadJSON(SETTINGS_PATH)
+    if cfg then
+        State.AutoJoin      = cfg.AutoJoin and true or false
+        State.AutoInject    = cfg.AutoInject and true or false
+        State.IgnoreEnabled = cfg.IgnoreEnabled and true or false
+        State.JoinRetry     = tonumber(cfg.JoinRetry) or State.JoinRetry
+        State.MinMS         = tonumber(cfg.MinMS) or State.MinMS
+        State.IgnoreNames   = type(cfg.IgnoreNames)=="table" and cfg.IgnoreNames or State.IgnoreNames
+    end
+end
 
--- === Style ===
+-- === Стиль/утилы UI ===
 local COLORS = {
     purpleDeep  = Color3.fromRGB(96, 63, 196),
     purple      = Color3.fromRGB(134, 102, 255),
@@ -73,7 +92,6 @@ local COLORS = {
 }
 local ALPHA = { panel = 0.12, card = 0.18 }
 
--- === UI helpers ===
 local function roundify(o, px) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0, px or 10); c.Parent=o; return c end
 local function stroke(o, col, th, tr) local s=Instance.new("UIStroke"); s.Color=col or COLORS.stroke; s.Thickness=th or 1; s.Transparency=tr or 0.25; s.ApplyStrokeMode=Enum.ApplyStrokeMode.Border; s.Parent=o; return s end
 local function padding(o,l,t,r,b) local p=Instance.new("UIPadding"); p.PaddingLeft=UDim.new(0,l or 0); p.PaddingTop=UDim.new(0,t or 0); p.PaddingRight=UDim.new(0,r or 0); p.PaddingBottom=UDim.new(0,b or 0); p.Parent=o; return p end
@@ -95,12 +113,12 @@ local function mkHeader(parent, text)
     local g=Instance.new("UIGradient")
     g.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,COLORS.purpleDeep),ColorSequenceKeypoint.new(1,COLORS.purple)}
     g.Transparency=NumberSequence.new{NumberSequenceKeypoint.new(0,0.4),NumberSequenceKeypoint.new(1,0.4)}; g.Rotation=90; g.Parent=h
-    local t=mkLabel(h, text, 18, "bold", COLORS.textPrimary); t.Size=UDim2.new(1,0,1,0); return h
+    mkLabel(h, text, 18, "bold", COLORS.textPrimary).Size=UDim2.new(1,0,1,0); return h
 end
 local function mkToggle(parent, text, default)
     local row=Instance.new("Frame"); row.Name=text.."_Row"; row.BackgroundColor3=COLORS.surface2; row.BackgroundTransparency=ALPHA.card
     row.Size=UDim2.new(1,0,0,44); row.Parent=parent; roundify(row,10); stroke(row); padding(row,12,0,12,0)
-    local lbl=mkLabel(row, text, 17, "medium", COLORS.textPrimary); lbl.Size=UDim2.new(1,-80,1,0)
+    mkLabel(row, text, 17, "medium", COLORS.textPrimary).Size=UDim2.new(1,-80,1,0)
     local sw=Instance.new("TextButton"); sw.Text=""; sw.AutoButtonColor=false; sw.BackgroundColor3=Color3.fromRGB(40,40,48); sw.BackgroundTransparency=0.2
     sw.Size=UDim2.new(0,62,0,28); sw.AnchorPoint=Vector2.new(1,0.5); sw.Position=UDim2.new(1,-6,0.5,0); sw.Parent=row
     roundify(sw,14); stroke(sw, COLORS.purpleSoft, 1, 0.35)
@@ -130,7 +148,7 @@ end
 local function mkStackInput(parent, title, placeholder, defaultText, isNumeric)
     local row=Instance.new("Frame"); row.Name=title.."_Stacked"; row.BackgroundColor3=COLORS.surface2; row.BackgroundTransparency=ALPHA.card
     row.Size=UDim2.new(1,0,0,70); row.Parent=parent; roundify(row,10); stroke(row); padding(row,12,8,12,12)
-    local top=mkLabel(row, title, 16, "medium", COLORS.textPrimary); top.Size=UDim2.new(1,0,0,18)
+    mkLabel(row, title, 16, "medium", COLORS.textPrimary).Size=UDim2.new(1,0,0,18)
     local box=Instance.new("TextBox"); box.PlaceholderText=placeholder or ""; box.Text=defaultText or ""; box.ClearTextOnFocus=false
     box.TextSize=17; box.TextColor3=COLORS.textPrimary; box.PlaceholderColor3=COLORS.textWeak
     box.BackgroundColor3=Color3.fromRGB(32,32,38); box.BackgroundTransparency=0.15
@@ -142,22 +160,6 @@ local function mkStackInput(parent, title, placeholder, defaultText, isNumeric)
         if state.Changed then pcall(state.Changed, state.Value) end
     end)
     return row, state, box
-end
-local function makeDraggable(frame, handle)
-    handle=handle or frame
-    local dragging=false; local startPos; local startMouse
-    handle.InputBegan:Connect(function(input)
-        if input.UserInputType==Enum.UserInputType.MouseButton1 then
-            dragging=true; startPos=frame.Position; startMouse=input.Position
-            input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end)
-        end
-    end)
-    UIS.InputChanged:Connect(function(input)
-        if dragging and input.UserInputType==Enum.UserInputType.MouseMovement then
-            local d=input.Position-startMouse
-            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
-        end
-    end)
 end
 
 -- === Blur ===
@@ -175,14 +177,14 @@ local main=Instance.new("Frame"); main.Name="Main"; main.Size=UDim2.new(0,980,0,
 main.BackgroundColor3=COLORS.surface; main.BackgroundTransparency=ALPHA.panel; main.Parent=gui
 roundify(main,14); stroke(main, COLORS.purpleSoft, 1.5, 0.35); padding(main,10,10,10,10)
 
--- === Header (фиксированный хоткей T, без ребинда) ===
+-- Header
 local header=Instance.new("Frame"); header.Size=UDim2.new(1,0,0,48); header.BackgroundColor3=COLORS.surface2; header.BackgroundTransparency=ALPHA.card; header.Parent=main
 roundify(header,10); stroke(header); padding(header,14,6,14,6)
-local title=mkLabel(header,"FLOPPA AUTO JOINER",20,"bold",COLORS.textPrimary); title.Size=UDim2.new(0.6,0,1,0)
+mkLabel(header,"FLOPPA AUTO JOINER",20,"bold",COLORS.textPrimary).Size=UDim2.new(0.6,0,1,0)
 local hotkeyInfo=mkLabel(header,"OPEN GUI KEY:  T",16,"medium",COLORS.textWeak)
 hotkeyInfo.AnchorPoint=Vector2.new(1,0.5); hotkeyInfo.Position=UDim2.new(1,-14,0.5,0); hotkeyInfo.Size=UDim2.new(0.35,0,1,0); hotkeyInfo.TextXAlignment=Enum.TextXAlignment.Right
 
--- === Left column ===
+-- Left / Right columns
 local left=Instance.new("ScrollingFrame"); left.Size=UDim2.new(0,300,1,-58); left.Position=UDim2.new(0,0,0,58); left.BackgroundTransparency=1
 left.ScrollBarThickness=6; left.ScrollingDirection=Enum.ScrollingDirection.Y; left.CanvasSize=UDim2.new(0,0,0,0); left.Parent=main
 local leftPad=padding(left,0,0,0,10)
@@ -190,82 +192,50 @@ local leftList=Instance.new("UIListLayout"); leftList.Padding=UDim.new(0,10); le
 local function updateLeftCanvas() left.CanvasSize=UDim2.new(0,0,0,leftList.AbsoluteContentSize.Y+leftPad.PaddingBottom.Offset) end
 leftList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateLeftCanvas)
 
--- === Right panel ===
 local right=Instance.new("Frame"); right.Size=UDim2.new(1,-320,1,-58); right.Position=UDim2.new(0,320,0,58)
 right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card; right.Parent=main
 roundify(right,12); stroke(right); padding(right,12,12,12,12)
 
--- === Blocks ===
+-- ==== Controls (используем значения State как дефолты) ====
 mkHeader(left,"PRIORITY ACTIONS")
-local autoJoinRow, autoJoin, applyAutoJoin = mkToggle(left, "AUTO JOIN", false)
-local jrRow, joinRetryState, jrBox = mkStackInput(left, "JOIN RETRY", "50", "50", true)
+local _, autoJoin,     applyAutoJoin   = mkToggle(left, "AUTO JOIN", State.AutoJoin)
+local _, _,            jrBox           = mkStackInput(left, "JOIN RETRY", "50", tostring(State.JoinRetry), true)
 
 mkHeader(left,"MONEY FILTERS")
-local msRow, minMSState, msBox = mkStackInput(left, "MIN M/S", "100", "100", true)
+local _, _,            msBox           = mkStackInput(left, "MIN M/S", "100", tostring(State.MinMS), true)
 
 mkHeader(left,"НАСТРОЙКИ")
-local autoInjectRow, autoInject, applyAutoInject = mkToggle(left, "AUTO INJECT", false)
-local ignoreListRow, ignoreToggle, applyIgnoreToggle = mkToggle(left, "ENABLE IGNORE LIST", false)
-local ignoreRow, ignoreState, ignoreBox = mkStackInput(left, "IGNORE NAMES", "name1,name2,...", "", false)
+local _, autoInject,   applyAutoInject = mkToggle(left, "AUTO INJECT", State.AutoInject)
+local _, ignoreToggle, applyIgnoreTgl  = mkToggle(left, "ENABLE IGNORE LIST", State.IgnoreEnabled)
+local _, ignoreState,  ignoreBox       = mkStackInput(left, "IGNORE NAMES", "name1,name2,...", table.concat(State.IgnoreNames, ","), false)
 
--- === Demo list ===
-local listHeader=mkHeader(right,"AVAILABLE LOBBIES"); listHeader.Size=UDim2.new(1,0,0,40)
+-- Right header only (список опустим)
+mkHeader(right,"AVAILABLE LOBBIES").Size=UDim2.new(1,0,0,40)
 
--- === State + persistence ===
-local State = {
-    AutoJoin=false, AutoInject=false, IgnoreEnabled=false,
-    JoinRetry=tonumber(jrBox.Text) or 50,
-    MinMS=tonumber(msBox.Text) or 100,
-    IgnoreNames={}
-}
-local LOADING = true
-local function parseIgnore(s) local r={} for token in string.gmatch(s or "", "([^,%s]+)") do table.insert(r, token) end return r end
-local function joinIgnore(t) return table.concat(t or {}, ",") end
-
--- загрузка конфига и ПРИМЕНЕНИЕ К UI
-do
-    local cfg = loadJSON(SETTINGS_PATH)
-    if cfg then
-        State.AutoJoin      = cfg.AutoJoin and true or false
-        State.AutoInject    = cfg.AutoInject and true or false
-        State.IgnoreEnabled = cfg.IgnoreEnabled and true or false
-        State.JoinRetry     = tonumber(cfg.JoinRetry) or State.JoinRetry
-        State.MinMS         = tonumber(cfg.MinMS) or State.MinMS
-        State.IgnoreNames   = type(cfg.IgnoreNames)=="table" and cfg.IgnoreNames or State.IgnoreNames
-
-        -- применяем визуально:
-        applyAutoJoin(State.AutoJoin, true)
-        applyAutoInject(State.AutoInject, true)
-        applyIgnoreToggle(State.IgnoreEnabled, true)
-        jrBox.Text = tostring(State.JoinRetry)
-        msBox.Text = tostring(State.MinMS)
-        ignoreBox.Text = joinIgnore(State.IgnoreNames)
-    end
-end
-
+-- === Сохранение настроек ===
+local LOADING = false
+local function parseIgnore(s) local r={} for token in string.gmatch(s or "", "([^,%s]+)") do r[#r+1]=token end return r end
 local function saveSettings()
     if LOADING then return end
-    local payload = {
-        AutoJoin     = State.AutoJoin,
-        AutoInject   = State.AutoInject,
-        IgnoreEnabled= State.IgnoreEnabled,
-        JoinRetry    = State.JoinRetry,
-        MinMS        = State.MinMS,
-        IgnoreNames  = State.IgnoreNames,
-    }
-    saveJSON(SETTINGS_PATH, payload)
+    saveJSON(SETTINGS_PATH, {
+        AutoJoin      = autoJoin.Value,
+        AutoInject    = autoInject.Value,
+        IgnoreEnabled = ignoreToggle.Value,
+        JoinRetry     = tonumber(jrBox.Text) or State.JoinRetry,
+        MinMS         = tonumber(msBox.Text) or State.MinMS,
+        IgnoreNames   = parseIgnore(ignoreBox.Text),
+    })
 end
 
-autoJoin.Changed      = function(v) State.AutoJoin = v; saveSettings() end
-autoInject.Changed    = function(v) State.AutoInject = v; saveSettings() end
-ignoreToggle.Changed  = function(v) State.IgnoreEnabled = v; saveSettings() end
-jrBox.FocusLost:Connect(function() State.JoinRetry = tonumber(jrBox.Text) or State.JoinRetry; saveSettings() end)
-msBox.FocusLost:Connect(function() State.MinMS    = tonumber(msBox.Text) or State.MinMS;    saveSettings() end)
-ignoreState.Changed   = function(text) State.IgnoreNames = parseIgnore(text); saveSettings() end
+autoJoin.Changed     = function(v) State.AutoJoin=v;      saveSettings() end
+autoInject.Changed   = function(v) State.AutoInject=v;    saveSettings() end
+ignoreToggle.Changed = function(v) State.IgnoreEnabled=v; saveSettings() end
+jrBox.FocusLost:Connect(function() State.JoinRetry=tonumber(jrBox.Text) or State.JoinRetry; saveSettings() end)
+msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; saveSettings() end)
+ignoreState.Changed  = function(txt) State.IgnoreNames=parseIgnore(txt); saveSettings() end
 
-LOADING=false; saveSettings()
-
--- === Auto Inject (Только очередь, без "run now") ===
+-- === Auto Inject (только очередь) ===
+local player = Players.LocalPlayer
 local function pickQueue()
     local q=nil
     pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end)
@@ -275,23 +245,17 @@ local function pickQueue()
     return q
 end
 local function makeBootstrap(url)
-    url = tostring(url or "")
+    url=tostring(url or "")
     local s=""
     s=s.."task.spawn(function()\n"
-    s=s.."  -- надёжная инициализация\n"
     s=s.."  if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end\n"
-    s=s.."  local okP, Pl = pcall(function() return game:GetService('Players') end)\n"
+    s=s.."  local okP,Pl=pcall(function() return game:GetService('Players') end)\n"
     s=s.."  if okP and Pl then local t0=os.clock(); while not Pl.LocalPlayer and os.clock()-t0<10 do task.wait(0.05) end end\n"
-    s=s.."  -- сброс флага, чтобы GUI разрешил перезапуск\n"
     s=s.."  pcall(function() getgenv().__FLOPPA_UI_ACTIVE=nil end)\n"
     s=s.."  local function safeget(u)\n"
-    s=s.."    for i=1,3 do\n"
-    s=s.."      local ok,res=pcall(function() return game:HttpGet(u) end)\n"
-    s=s.."      if ok and type(res)=='string' and #res>0 then return res end\n"
-    s=s.."      task.wait(1)\n"
-    s=s.."    end\n"
+    s=s.."    for i=1,3 do local ok,res=pcall(function() return game:HttpGet(u) end); if ok and type(res)=='string' and #res>0 then return res end; task.wait(1) end\n"
     s=s.."  end\n"
-    s=s.."  local src=safeget('"..url.."')\n"
+    s=s.."  local src=safeget('"..AUTO_INJECT_URL.."')\n"
     s=s.."  if src then local f=loadstring(src); if f then pcall(f) end end\n"
     s=s.."end)\n"
     return s
@@ -300,24 +264,33 @@ local function queueReinject(url)
     local q = pickQueue()
     if q and url~="" then q(makeBootstrap(url)) end
 end
-
--- ставим/снимаем очередь при клике (без немедленного запуска)
-autoInject.Changed = function(v)
-    State.AutoInject = v; saveSettings()
-    -- если включили — очередь уже поставится при следующем телепорте
-end
-
--- При старте, если тумблер был включён — ставим очередь на следующий телепорт
-if State.AutoInject then queueReinject(AUTO_INJECT_URL) end
-
--- Телепорт → ставим очередь ещё раз
+-- Если в конфиге был включён — ставим очередь прямо сейчас
+if autoInject.Value then queueReinject(AUTO_INJECT_URL) end
+-- И дублируем при телепорте
 player.OnTeleport:Connect(function(st)
-    if State.AutoInject and st==Enum.TeleportState.Started then
+    if autoInject.Value and st==Enum.TeleportState.Started then
         queueReinject(AUTO_INJECT_URL)
     end
 end)
 
--- === Show/hide: фиксированный хоткей T ===
+-- === Показ/скрытие (T) + drag ===
+local function makeDraggable(frame, handle)
+    handle=handle or frame
+    local dragging=false; local startPos; local startMouse
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 then
+            dragging=true; startPos=frame.Position; startMouse=input.Position
+            input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType==Enum.UserInputType.MouseMovement then
+            local d=input.Position-startMouse
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+        end
+    end)
+end
+
 local opened=true
 local function setVisible(v,instant)
     opened=v; if v then setBlur(true) else setBlur(false) end
@@ -330,13 +303,22 @@ local function setVisible(v,instant)
     end
 end
 
--- Горячая клавиша: T
 UIS.InputBegan:Connect(function(input, gp)
     if not gp and input.KeyCode==FIXED_HOTKEY then
         setVisible(not opened, false)
     end
 end)
-
--- Drag
 makeDraggable(main, header)
-task.defer(function() updateLeftCanvas(); setVisible(true,true) end)
+
+-- финальный рефреш после показа — на случай редких гонок
+local function refreshUI()
+    -- применяем актуальные значения ещё раз (визуал only)
+    applyAutoJoin(autoJoin.Value, true)
+    applyAutoInject(autoInject.Value, true)
+    applyIgnoreTgl(ignoreToggle.Value, true)
+end
+
+task.defer(function()
+    updateLeftCanvas(); setVisible(true,true)
+    task.delay(0.05, refreshUI)
+end)
