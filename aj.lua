@@ -1,10 +1,11 @@
 --[[
-  FLOPPA AUTO JOINER v5.3
+  FLOPPA AUTO JOINER v5.4
   • MIN M/S -> МИЛЛИОНЫ ($/s): 1 => $1,000,000/s
-  • Парсит HTML/<br>, CR/LF и Юникод NBSP (U+00A0)
-  • Дедуп по job_id (берём запись с max $/s)
-  • JOIN retry 10/сек, автоочистка >180с, подсветка свежих
-  • Хоткей: T, конфиг JSON: floppa_aj_settings.json
+  • Парсит HTML/<br>, CR/LF и NBSP; терпит "$22.5M/s", "$22M/s", "$780K/s"
+  • Дедуп по job_id (оставляет запись с max $/s)
+  • JOIN retry 10/сек, автоочистка записей старше 180с, подсветка свежих
+  • Хоткей: T; конфиг JSON: floppa_aj_settings.json
+  • AUTO INJECT: очередь на телепорт (без “run now”), переживает переходы
 ]]
 
 ---------------- USER/API SETTINGS ----------------
@@ -71,7 +72,7 @@ local State = {
     AutoInject    = false,
     IgnoreEnabled = false,
     JoinRetry     = 50,
-    MinMS         = 1,       -- МИЛЛИОНЫ
+    MinMS         = 1,       -- МИЛЛИОНЫ ($/s)
     IgnoreNames   = {}
 }
 do
@@ -207,10 +208,14 @@ right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card;
 roundify(right,12); stroke(right); padding(right,12,12,12,12)
 
 -- Empty-state badge
-local emptyBadge = mkLabel(right, "", 14, "medium", Color3.fromRGB(255,150,150))
-emptyBadge.Size = UDim2.new(1, -10, 0, 18)
-emptyBadge.Position = UDim2.new(0, 6, 0, 6)
-emptyBadge.Visible = false
+local function mkBadge(parent)
+    local t = mkLabel(parent, "", 14, "medium", Color3.fromRGB(255,150,150))
+    t.Size = UDim2.new(1, -10, 0, 18)
+    t.Position = UDim2.new(0, 6, 0, 6)
+    t.Visible = false
+    return t
+end
+local emptyBadge = mkBadge(right)
 
 -- Left blocks
 mkHeader(left,"PRIORITY ACTIONS")
@@ -279,11 +284,16 @@ local function queueReinject(url) local q=pickQueue(); if q and url~="" then q(m
 if State.AutoInject then queueReinject(AUTO_INJECT_URL) end
 Players.LocalPlayer.OnTeleport:Connect(function(st) if autoInject.Value and st==Enum.TeleportState.Started then queueReinject(AUTO_INJECT_URL) end end)
 
--- Network parsing / rendering
+-- Money parser (robust)
 local multipliers = {K=1e3, M=1e6, B=1e9, T=1e12}
 local function parseMoney(text)
-    text = tostring(text or ""):upper():gsub(",", "")
-    local num, unit = text:match("%$%s*([%d%.]+)%s*([KMBT]?)%s*/%s*S")
+    local s = tostring(text or "")
+    s = s:gsub("\194\160"," ")  -- NBSP -> space
+         :gsub(",", "")         -- 11,200,000 -> 11200000
+         :gsub("%s+", "")       -- remove all spaces
+         :upper()               -- K/M/B/T and S
+    local num, unit = s:match("%$(%d+%.?%d*)([KMBT]?)/S")
+    if not num then num, unit = s:match("%$(%d+%.?%d*)([KMBT]?)") end
     if not num then return 0 end
     local n = tonumber(num) or 0
     local mul = multipliers[unit or ""] or 1
@@ -296,15 +306,10 @@ local function minThreshold()
     return v * 1e6
 end
 
-local function buildURL(withKey)
-    if withKey == false then return SERVER_URL end
-    local sep = SERVER_URL:find("?") and "&" or "?"
-    return SERVER_URL .. sep .. "key=" .. tostring(API_KEY)
-end
-
+-- Filters
 local function visibleByFilters(d)
     if d.mps < minThreshold() then return false end
-    if State.IgnoreEnabled then
+    if ignoreToggle.Value and #State.IgnoreNames>0 then
         for _,nm in ipairs(State.IgnoreNames) do
             if #nm>0 and d.name:lower():find(nm:lower(),1,true) then return false end
         end
@@ -410,16 +415,17 @@ local function refreshListVisual()
     emptyBadge.Visible = (visibleCount == 0)
     if emptyBadge.Visible then
         local minM = tonumber(msBox.Text) or State.MinMS or 0
-        local ig  = (State.IgnoreEnabled and #State.IgnoreNames>0) and ("; ignore: "..table.concat(State.IgnoreNames, ",")) or ""
+        local ig  = (ignoreToggle.Value and #State.IgnoreNames>0) and ("; ignore: "..table.concat(State.IgnoreNames, ",")) or ""
         emptyBadge.Text = ("No lobbies pass filters (min= %dM/s%s)"):format(minM, ig)
     end
     task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
 end
 
--- Robust trim (включая NBSP)
+-- Robust trim (incl. NBSP)
 local function trimSpaces(s)
-    s = s:gsub("\226\128\139", "")      -- ZERO WIDTH NO-BREAK SPACE (на всякий)
-    s = s:gsub("\194\160", " ")         -- NBSP
+    s = tostring(s or "")
+    s = s:gsub("\226\128\139", "") -- zero-width no-break space (на всякий случай)
+         :gsub("\194\160", " ")    -- NBSP
     s = s:gsub("^%s+",""):gsub("%s+$","")
     return s
 end
@@ -427,13 +433,12 @@ end
 -- parse one line
 local function parseLine(line)
     line = tostring(line or "")
-    line = line:gsub("%*%*", ""):gsub("\t"," ")
-    line = line:gsub("\194\160"," ")   -- NBSP -> space
+    line = line:gsub("%*%*", ""):gsub("\t"," "):gsub("\194\160"," ")
     local parts = {}
     for token in line:gmatch("([^|]+)") do
         parts[#parts+1] = trimSpaces(token)
     end
-    if #parts < 4 then return nil end  -- ts может отсутствовать
+    if #parts < 4 then return nil end -- timestamp можно отсутствовать
     local name, moneyStr, playersStr, jobId = parts[1], parts[2], parts[3], parts[4]
     local pNow, pMax = playersStr:match("(%d+)%s*/%s*(%d+)")
     pNow = tonumber(pNow or "0") or 0
@@ -451,7 +456,7 @@ local function parseAll(raw)
                :gsub("<[Bb][Rr]%s*/?>","\n")
                :gsub("</?%w+[^>]*>","")
                :gsub("&nbsp;"," ")
-               :gsub("\194\160"," ")       -- NBSP (UTF-8)
+               :gsub("\194\160"," ")       -- NBSP
     local now  = os.clock()
     local best = {}  -- jobId -> best record
 
@@ -476,11 +481,16 @@ local function parseAll(raw)
 end
 
 -- pull with fallback
+local function buildURL(withKey)
+    if withKey == false then return SERVER_URL end
+    local sep = SERVER_URL:find("?") and "&" or "?"
+    return SERVER_URL .. sep .. "key=" .. tostring(API_KEY)
+end
 local function pullOnce()
-    local ok, body = pcall(function() return game:HttpGet((SERVER_URL:find("?") and SERVER_URL.."&key=" or SERVER_URL.."?" ).."key="..tostring(API_KEY)) end)
+    local ok, body = pcall(function() return game:HttpGet(buildURL(true)) end)
     if not ok or type(body)~="string" or #body==0 then
         if DEBUG_NETWORK then warn("[Floppa] key-request failed, trying without key…") end
-        ok, body = pcall(function() return game:HttpGet(SERVER_URL) end)
+        ok, body = pcall(function() return game:HttpGet(buildURL(false)) end)
     end
     if ok and type(body)=="string" and #body>0 then
         if DEBUG_NETWORK then print("[Floppa] got bytes:", #body) end
