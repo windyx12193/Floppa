@@ -1,23 +1,39 @@
 --[[
-  FLOPPA AUTO JOINER - Luau-safe v4.7 (JSON-first init)
-  • Хоткей фикс.: T
-  • queue_on_teleport bootstrap (без run-now), сброс __FLOPPA_UI_ACTIVE
-  • Конфиг JSON читается ДО создания UI → тумблеры/поля рисуются сразу правильно
-  • Финальный refreshUI() после показа окна
+  FLOPPA AUTO JOINER v5.0 (networked)
+  • Хоткей: T, JSON-конфиг как в v4.7
+  • Подтягивает список лобби с твоего бэкенда и рендерит в AVAILABLE LOBBIES
+  • Формат: NAME | **$X/s** | **P/M** | JOB_ID | TIMESTAMP
+  • JOIN: TeleportService:TeleportToPlaceInstance(PLACE_ID, JOB_ID, LocalPlayer)
+  • JOIN RETRY: число повторов, частота 10/сек (0.1s между попытками)
+  • Очистка «старых» лобби: всё что старше 180 сек удаляется, «свежие» подсвечены, «стареющие» немного тускнеют
 ]]
 
------------------- USER SETTINGS ------------------
+---------------- USER/API SETTINGS ----------------
 local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
 local FIXED_HOTKEY    = Enum.KeyCode.T
 local SETTINGS_PATH   = "floppa_aj_settings.json"
+
+-- API источник
+local SERVER_URL = "https://server-eta-two-29.vercel.app/"
+local API_KEY    = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
+
+-- игру куда телепортируем
+local TARGET_PLACE_ID = 109983668079237
+
+-- частота опроса и устаревание
+local PULL_INTERVAL_SEC = 2.0
+local ENTRY_TTL_SEC     = 180.0  -- 3 минуты
+local FRESH_AGE_SEC     = 12.0   -- пока что считаем «новым» (для подсветки)
+
 ---------------------------------------------------
 
--- === Services & FS ===
+-- ====== Services / FS / JSON ======
 local Players      = game:GetService("Players")
 local UIS          = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Lighting     = game:GetService("Lighting")
 local HttpService  = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 
 local function hasFS()
     return typeof(writefile)=="function" and typeof(readfile)=="function" and typeof(isfile)=="function"
@@ -37,25 +53,25 @@ local function loadJSON(path)
     return tbl
 end
 
--- === Singleton-friendly очистка старого GUI ===
+-- ====== Singleton cleanup ======
 local function findGuiParent()
     local okH, hui = pcall(function() return gethui and gethui() end)
     if okH and hui then return hui end
     local okC, core = pcall(function() return game:GetService("CoreGui") end)
     if okC then return core end
-    return Players.LocalPlayer and Players.LocalPlayer:FindFirstChild("PlayerGui") or nil
+    return Players.LocalPlayer and Players.LocalPlayer:FindChildOfClass("PlayerGui") or nil
 end
 do
-    local parent = findGuiParent()
-    if parent then
-        local old = parent:FindFirstChild("FloppaAutoJoinerGui")
+    local par = findGuiParent()
+    if par then
+        local old = par:FindFirstChild("FloppaAutoJoinerGui")
         if old then pcall(function() old:Destroy() end) end
     end
     local G = (getgenv and getgenv()) or _G
     G.__FLOPPA_UI_ACTIVE = true
 end
 
--- === СНАЧАЛА загружаем конфиг ===
+-- ====== State (загружаем ДО UI) ======
 local State = {
     AutoJoin      = false,
     AutoInject    = false,
@@ -76,7 +92,7 @@ do
     end
 end
 
--- === Стиль/утилы UI ===
+-- ====== Style / helpers ======
 local COLORS = {
     purpleDeep  = Color3.fromRGB(96, 63, 196),
     purple      = Color3.fromRGB(134, 102, 255),
@@ -162,7 +178,7 @@ local function mkStackInput(parent, title, placeholder, defaultText, isNumeric)
     return row, state, box
 end
 
--- === Blur ===
+-- ====== Blur ======
 local blur=Lighting:FindFirstChild("FloppaLightBlur") or Instance.new("BlurEffect")
 blur.Name="FloppaLightBlur"; blur.Size=0; blur.Enabled=false; blur.Parent=Lighting
 local function setBlur(e)
@@ -170,7 +186,7 @@ local function setBlur(e)
     else TweenService:Create(blur, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Size=0}):Play(); task.delay(0.16,function() blur.Enabled=false end) end
 end
 
--- === Root GUI ===
+-- ====== Root GUI ======
 local parent = findGuiParent() or Players.LocalPlayer:WaitForChild("PlayerGui")
 local gui=Instance.new("ScreenGui"); gui.Name="FloppaAutoJoinerGui"; gui.IgnoreGuiInset=true; gui.ResetOnSpawn=false; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; gui.DisplayOrder=1e6; gui.Parent=parent
 local main=Instance.new("Frame"); main.Name="Main"; main.Size=UDim2.new(0,980,0,560); main.Position=UDim2.new(0.5,-490,0.5,-280)
@@ -184,7 +200,7 @@ mkLabel(header,"FLOPPA AUTO JOINER",20,"bold",COLORS.textPrimary).Size=UDim2.new
 local hotkeyInfo=mkLabel(header,"OPEN GUI KEY:  T",16,"medium",COLORS.textWeak)
 hotkeyInfo.AnchorPoint=Vector2.new(1,0.5); hotkeyInfo.Position=UDim2.new(1,-14,0.5,0); hotkeyInfo.Size=UDim2.new(0.35,0,1,0); hotkeyInfo.TextXAlignment=Enum.TextXAlignment.Right
 
--- Left / Right columns
+-- Columns
 local left=Instance.new("ScrollingFrame"); left.Size=UDim2.new(0,300,1,-58); left.Position=UDim2.new(0,0,0,58); left.BackgroundTransparency=1
 left.ScrollBarThickness=6; left.ScrollingDirection=Enum.ScrollingDirection.Y; left.CanvasSize=UDim2.new(0,0,0,0); left.Parent=main
 local leftPad=padding(left,0,0,0,10)
@@ -196,7 +212,7 @@ local right=Instance.new("Frame"); right.Size=UDim2.new(1,-320,1,-58); right.Pos
 right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card; right.Parent=main
 roundify(right,12); stroke(right); padding(right,12,12,12,12)
 
--- ==== Controls (используем значения State как дефолты) ====
+-- Left blocks
 mkHeader(left,"PRIORITY ACTIONS")
 local _, autoJoin,     applyAutoJoin   = mkToggle(left, "AUTO JOIN", State.AutoJoin)
 local _, _,            jrBox           = mkStackInput(left, "JOIN RETRY", "50", tostring(State.JoinRetry), true)
@@ -209,12 +225,15 @@ local _, autoInject,   applyAutoInject = mkToggle(left, "AUTO INJECT", State.Aut
 local _, ignoreToggle, applyIgnoreTgl  = mkToggle(left, "ENABLE IGNORE LIST", State.IgnoreEnabled)
 local _, ignoreState,  ignoreBox       = mkStackInput(left, "IGNORE NAMES", "name1,name2,...", table.concat(State.IgnoreNames, ","), false)
 
--- Right header only (список опустим)
-mkHeader(right,"AVAILABLE LOBBIES").Size=UDim2.new(1,0,0,40)
+-- Right list
+local listHeader=mkHeader(right,"AVAILABLE LOBBIES"); listHeader.Size=UDim2.new(1,0,0,40)
+local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; scroll.Size=UDim2.new(1,0,1,-50); scroll.Position=UDim2.new(0,0,0,46)
+scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent=right
+local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
 
--- === Сохранение настроек ===
-local LOADING = false
-local function parseIgnore(s) local r={} for token in string.gmatch(s or "", "([^,%s]+)") do r[#r+1]=token end return r end
+-- ====== Persist settings ======
+local LOADING=false
+local function parseIgnore(s) local r={} for tok in (s or ""):gmatch("([^,%s]+)") do r[#r+1]=tok end return r end
 local function saveSettings()
     if LOADING then return end
     saveJSON(SETTINGS_PATH, {
@@ -226,7 +245,6 @@ local function saveSettings()
         IgnoreNames   = parseIgnore(ignoreBox.Text),
     })
 end
-
 autoJoin.Changed     = function(v) State.AutoJoin=v;      saveSettings() end
 autoInject.Changed   = function(v) State.AutoInject=v;    saveSettings() end
 ignoreToggle.Changed = function(v) State.IgnoreEnabled=v; saveSettings() end
@@ -234,8 +252,7 @@ jrBox.FocusLost:Connect(function() State.JoinRetry=tonumber(jrBox.Text) or State
 msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; saveSettings() end)
 ignoreState.Changed  = function(txt) State.IgnoreNames=parseIgnore(txt); saveSettings() end
 
--- === Auto Inject (только очередь) ===
-local player = Players.LocalPlayer
+-- ====== AutoInject queue (как в v4.7) ======
 local function pickQueue()
     local q=nil
     pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end)
@@ -252,9 +269,7 @@ local function makeBootstrap(url)
     s=s.."  local okP,Pl=pcall(function() return game:GetService('Players') end)\n"
     s=s.."  if okP and Pl then local t0=os.clock(); while not Pl.LocalPlayer and os.clock()-t0<10 do task.wait(0.05) end end\n"
     s=s.."  pcall(function() getgenv().__FLOPPA_UI_ACTIVE=nil end)\n"
-    s=s.."  local function safeget(u)\n"
-    s=s.."    for i=1,3 do local ok,res=pcall(function() return game:HttpGet(u) end); if ok and type(res)=='string' and #res>0 then return res end; task.wait(1) end\n"
-    s=s.."  end\n"
+    s=s.."  local function safeget(u) for i=1,3 do local ok,res=pcall(function() return game:HttpGet(u) end); if ok and type(res)=='string' and #res>0 then return res end; task.wait(1) end end\n"
     s=s.."  local src=safeget('"..AUTO_INJECT_URL.."')\n"
     s=s.."  if src then local f=loadstring(src); if f then pcall(f) end end\n"
     s=s.."end)\n"
@@ -264,16 +279,228 @@ local function queueReinject(url)
     local q = pickQueue()
     if q and url~="" then q(makeBootstrap(url)) end
 end
--- Если в конфиге был включён — ставим очередь прямо сейчас
 if autoInject.Value then queueReinject(AUTO_INJECT_URL) end
--- И дублируем при телепорте
-player.OnTeleport:Connect(function(st)
+Players.LocalPlayer.OnTeleport:Connect(function(st)
     if autoInject.Value and st==Enum.TeleportState.Started then
         queueReinject(AUTO_INJECT_URL)
     end
 end)
 
--- === Показ/скрытие (T) + drag ===
+-- ====== Network parsing / rendering ======
+
+local function buildURL()
+    -- если у тебя не корневой путь — замени здесь, напр. SERVER_URL.."api/list?key="..API_KEY
+    local sep = SERVER_URL:find("?") and "&" or "?"
+    return SERVER_URL .. sep .. "key=" .. tostring(API_KEY)
+end
+
+-- "$780K/s" -> 780000; "$1.2M/s" -> 1200000; "$1.5B/s" -> 1500000000
+local multipliers = {K=1e3, M=1e6, B=1e9, T=1e12}
+local function parseMoney(text)
+    text = tostring(text or ""):upper()
+    local num, unit = text:match("%$%s*([%d%.]+)%s*([KMBT]?)%s*/S")
+    num = tonumber(num or "0") or 0
+    local mul = unit and multipliers[unit] or 1
+    return math.floor(num * mul + 0.5)
+end
+
+-- строка в формате: name | **$X/s** | **p/m** | job | ts
+local function parseLine(line)
+    local parts = {}
+    for token in tostring(line):gmatch("([^|]+)") do
+        parts[#parts+1] = (token:gsub("^%s+",""):gsub("%s+$",""))
+    end
+    if #parts < 5 then return nil end
+    local name = parts[1]
+    local moneyStr = parts[2]  -- **$780K/s**
+    local playersStr = parts[3] -- **6/8**
+    local jobId = parts[4]
+    local ts = parts[5]        -- текстовая дата, можно не парсить
+
+    local pNow, pMax = playersStr:match("%*%*(%d+)%s*/%s*(%d+)%*%*")
+    if not pNow then pNow, pMax = playersStr:match("(%d+)%s*/%s*(%d+)") end
+    pNow = tonumber(pNow or "0") or 0
+    pMax = tonumber(pMax or "0") or 0
+
+    local mps = parseMoney(moneyStr)
+
+    return {
+        name = name,
+        moneyStr = (moneyStr:gsub("%*","")),
+        mps = mps,
+        players = pNow,
+        max = pMax,
+        jobId = jobId,
+        ts = ts
+    }
+end
+
+-- хранение и UI-элементы
+local Entries = {}   -- by jobId -> {data, frame, firstSeen, lastSeen}
+local Order = {}     -- массив jobIds (для сортировки)
+
+local function visibleByFilters(d)
+    if State.IgnoreEnabled then
+        for _,nm in ipairs(State.IgnoreNames) do
+            if #nm>0 and d.name:lower():find(nm:lower(),1,true) then
+                return false
+            end
+        end
+    end
+    if d.mps < (tonumber(msBox.Text) or State.MinMS)*1000 then
+        -- ВАЖНО: msBox — это «мин/мс» в текстовом виде: если пользователь вводит "100", это 100K/s?
+        -- Мы трактуем как $/s в ЧИСЛЕ, поэтому умножаем на 1000 (K). При желании убери "*1000".
+    end
+    return d.mps >= ((tonumber(msBox.Text) or State.MinMS) * 1000)
+end
+
+local function formatPlayers(p,m)
+    return string.format("%d/%d", p or 0, m or 0)
+end
+
+local function ensureEntryFrame(jobId, data)
+    local e = Entries[jobId]
+    if e and e.frame then return e.frame end
+
+    local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel
+    item.Parent=scroll; roundify(item,10); stroke(item, COLORS.purpleSoft, 1, 0.35); padding(item,12,6,12,6)
+
+    local nameLbl=mkLabel(item, string.upper(data.name), 18, "bold", COLORS.textPrimary)
+    nameLbl.Size=UDim2.new(0.44,-10,1,0)
+
+    local moneyLbl=mkLabel(item, string.upper((data.moneyStr or "")), 17, "medium", Color3.fromRGB(130,255,130))
+    moneyLbl.AnchorPoint=Vector2.new(0,0.5); moneyLbl.Position=UDim2.new(0.46,0,0.5,0)
+    moneyLbl.Size=UDim2.new(0.22,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Left
+
+    local playersLbl=mkLabel(item, formatPlayers(data.players, data.max), 16, "medium", COLORS.textWeak)
+    playersLbl.AnchorPoint=Vector2.new(0,0.5); playersLbl.Position=UDim2.new(0.69,0,0.5,0)
+    playersLbl.Size=UDim2.new(0.12,0,1,0); playersLbl.TextXAlignment=Enum.TextXAlignment.Left
+
+    local joinBtn=Instance.new("TextButton"); joinBtn.Text="JOIN"; setFont(joinBtn,"bold"); joinBtn.TextSize=18; joinBtn.TextColor3=Color3.fromRGB(22,22,22)
+    joinBtn.AutoButtonColor=true; joinBtn.BackgroundColor3=COLORS.joinBtn; joinBtn.Size=UDim2.new(0,84,0,36); joinBtn.AnchorPoint=Vector2.new(1,0.5); joinBtn.Position=UDim2.new(1,-8,0.5,0)
+    roundify(joinBtn,10); stroke(joinBtn, Color3.fromRGB(0,0,0), 1, 0.7); joinBtn.Parent=item
+
+    joinBtn.MouseButton1Click:Connect(function()
+        -- ограниченная по времени серия попыток: State.JoinRetry, 10/сек
+        local tries = tonumber(jrBox.Text) or State.JoinRetry or 0
+        local delaySec = 0.10
+        joinBtn.Text = "JOIN…"
+        for i=1, math.max(tries,1) do
+            local ok, tpErr = pcall(function()
+                TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, Players.LocalPlayer)
+            end)
+            if ok then
+                joinBtn.Text = "OK"
+                break
+            else
+                -- если сервер полон/ошибка — просто ждём и пробуем снова
+                joinBtn.Text = ("RETRY %d/%d"):format(i, tries)
+                task.wait(delaySec)
+            end
+        end
+        task.delay(0.8, function() if joinBtn then joinBtn.Text="JOIN" end end)
+    end)
+
+    if not e then Entries[jobId] = {data=data, frame=item, firstSeen=os.clock(), lastSeen=os.clock()} end
+    return item
+end
+
+local function updateEntry(jobId, data)
+    local e = Entries[jobId]
+    if not e then
+        ensureEntryFrame(jobId, data)
+        e = Entries[jobId]
+        table.insert(Order, jobId)
+    else
+        e.data = data
+        e.lastSeen = os.clock()
+        -- обновим текст
+        local item = e.frame
+        if item and item.Parent then
+            local kids = item:GetChildren()
+            -- 1: name, 2: money, 3: players, 4: button (по созданию выше)
+            if kids[1] and kids[1].ClassName=="TextLabel" then kids[1].Text = string.upper(data.name) end
+            if kids[2] and kids[2].ClassName=="TextLabel" then kids[2].Text = string.upper((data.moneyStr or "")) end
+            if kids[3] and kids[3].ClassName=="TextLabel" then kids[3].Text = formatPlayers(data.players, data.max) end
+        end
+    end
+end
+
+local function removeEntry(jobId)
+    local e = Entries[jobId]
+    if not e then return end
+    if e.frame then pcall(function() e.frame:Destroy() end) end
+    Entries[jobId] = nil
+    for i=#Order,1,-1 do if Order[i]==jobId then table.remove(Order,i) break end end
+end
+
+local function refreshListVisual()
+    -- сортируем: сперва по mps (по убыв.), затем по свежести
+    table.sort(Order, function(a,b)
+        local ea, eb = Entries[a], Entries[b]
+        if not ea or not eb then return a<b end
+        if ea.data.mps ~= eb.data.mps then return ea.data.mps > eb.data.mps end
+        return ea.lastSeen > eb.lastSeen
+    end)
+    for idx, jobId in ipairs(Order) do
+        local e = Entries[jobId]
+        if e and e.frame and e.frame.Parent == scroll then
+            e.frame.LayoutOrder = idx
+            -- свежесть: новая — легкая зелёная подсветка, старая — немного темнее
+            local age = os.clock() - e.firstSeen
+            local alpha = 0.0
+            if age <= FRESH_AGE_SEC then
+                alpha = 0.0
+                e.frame.BackgroundColor3 = Color3.fromRGB(22, 28, 26) -- чуть зеленит фон для «новых»
+            else
+                e.frame.BackgroundColor3 = COLORS.surface
+                local staleness = math.clamp((os.clock()-e.lastSeen)/ENTRY_TTL_SEC, 0, 1)
+                e.frame.BackgroundTransparency = ALPHA.panel + 0.05*staleness
+            end
+        end
+    end
+    task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
+end
+
+local function parseAll(text)
+    local now = os.clock()
+    for line in tostring(text or ""):gmatch("(.-)\n") do
+        if line:match("%S") then
+            local d = parseLine(line)
+            if d then
+                if visibleByFilters(d) then
+                    updateEntry(d.jobId, d)
+                end
+            end
+        end
+    end
+    -- чистим устаревшие
+    for jobId, e in pairs(Entries) do
+        if (now - e.lastSeen) > ENTRY_TTL_SEC then
+            removeEntry(jobId)
+        end
+    end
+    refreshListVisual()
+end
+
+local function pullOnce()
+    local url = buildURL()
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and type(body)=="string" and #body>0 then
+        parseAll(body.."\n") -- гарантируем финальный \n
+    end
+end
+
+-- ====== Poll loop ======
+task.spawn(function()
+    while gui and gui.Parent do
+        -- фильтры могли измениться → лёгкая ресинхронизация:
+        pullOnce()
+        task.wait(PULL_INTERVAL_SEC)
+    end
+end)
+
+-- ====== Show/Hide + drag ======
 local function makeDraggable(frame, handle)
     handle=handle or frame
     local dragging=false; local startPos; local startMouse
@@ -302,23 +529,9 @@ local function setVisible(v,instant)
         t:Play(); if not v then t.Completed:Wait(); main.Visible=false end
     end
 end
-
 UIS.InputBegan:Connect(function(input, gp)
-    if not gp and input.KeyCode==FIXED_HOTKEY then
-        setVisible(not opened, false)
-    end
+    if not gp and input.KeyCode==FIXED_HOTKEY then setVisible(not opened,false) end
 end)
 makeDraggable(main, header)
 
--- финальный рефреш после показа — на случай редких гонок
-local function refreshUI()
-    -- применяем актуальные значения ещё раз (визуал only)
-    applyAutoJoin(autoJoin.Value, true)
-    applyAutoInject(autoInject.Value, true)
-    applyIgnoreTgl(ignoreToggle.Value, true)
-end
-
-task.defer(function()
-    updateLeftCanvas(); setVisible(true,true)
-    task.delay(0.05, refreshUI)
-end)
+task.defer(function() updateLeftCanvas(); setVisible(true,true) end)
