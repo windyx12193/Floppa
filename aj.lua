@@ -1,5 +1,5 @@
 --[[
-  FLOPPA AUTO JOINER - Luau-safe v4.8a (bit32 fix)
+  FLOPPA AUTO JOINER - Luau-safe v4.8
   • Fixed hotkey: T (eng)
   • Auto-inject only via queue_on_teleport (robust bootstrap)
   • Local config with encryption (TEA + Base64) at workspace/.floppa_aj/config.bin
@@ -19,11 +19,6 @@ local TweenService = game:GetService("TweenService")
 local Lighting     = game:GetService("Lighting")
 local HttpService  = game:GetService("HttpService")
 
--- quick bit32 aliases
-local band, bor, bxor = bit32.band, bit32.bor, bit32.bxor
-local lshift, rshift  = bit32.lshift, bit32.rshift
-local function u32(x) return band(x, 0xFFFFFFFF) end
-
 -- ====================================================================================
 -- CONFIG MANAGER (TEA + Base64)  -----------------------------------------------------
 -- ====================================================================================
@@ -42,17 +37,18 @@ local function ensureDir()
     if hasFS() then pcall(makefolder, CFG_DIR) end
 end
 
--- Base64 (без сторонних либ), только через числа
+-- Base64 (без сторонних либ)
 local B64 = (function()
-    local enc_tbl = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-    local dec_tbl = {}
-    for i=1,#enc_tbl do dec_tbl[string.byte(enc_tbl,i)] = i-1 end
+    local e = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    local d = {}
+    for i=1,#e do d[string.byte(e,i)] = i-1 end
     local function enc(data)
-        local out, n, i = {}, #data, 1
+        local out, n = {}, #data
+        local i=1
         while i<=n do
-            local b1 = data:byte(i) or 0; i=i+1
-            local b2 = data:byte(i) or 0; i=i+1
-            local b3 = data:byte(i) or 0; i=i+1
+            local b1 = data:byte(i)   or 0; i=i+1
+            local b2 = data:byte(i)   or 0; i=i+1
+            local b3 = data:byte(i)   or 0; i=i+1
             local triple = b1*65536 + b2*256 + b3
             local c1 = math.floor(triple/262144) % 64
             local c2 = math.floor(triple/4096)   % 64
@@ -60,10 +56,10 @@ local B64 = (function()
             local c4 = triple % 64
             local pad2 = (i-1>n)
             local pad1 = (i-2>n)
-            out[#out+1] = enc_tbl:sub(c1+1,c1+1)
-            out[#out+1] = enc_tbl:sub(c2+1,c2+1)
-            out[#out+1] = pad1 and '=' or enc_tbl:sub(c3+1,c3+1)
-            out[#out+1] = pad2 and '=' or enc_tbl:sub(c4+1,c4+1)
+            out[#out+1] = e:sub(c1+1,c1+1)
+            out[#out+1] = e:sub(c2+1,c2+1)
+            out[#out+1] = pad1 and '=' or e:sub(c3+1,c3+1)
+            out[#out+1] = pad2 and '=' or e:sub(c4+1,c4+1)
         end
         return table.concat(out)
     end
@@ -72,17 +68,17 @@ local B64 = (function()
         local out, bytes, n = {}, {data:byte(1,#data)}, #data
         local i=1
         while i<=n do
-            local c1 = dec_tbl[bytes[i]]; i=i+1
-            local c2 = dec_tbl[bytes[i]]; i=i+1
-            local c3b= bytes[i];         i=i+1
-            local c4b= bytes[i];         i=i+1
+            local c1 = d[bytes[i]]; i=i+1
+            local c2 = d[bytes[i]]; i=i+1
+            local c3b= bytes[i];    i=i+1
+            local c4b= bytes[i];    i=i+1
             if not c1 or not c2 then break end
-            local c3 = (c3b and c3b~=61) and dec_tbl[c3b] or nil
-            local c4 = (c4b and c4b~=61) and dec_tbl[c4b] or nil
-            local triple = bor(lshift(c1,18), lshift(c2,12), lshift(c3 or 0,6), (c4 or 0))
-            local b1 = band(rshift(triple,16), 255)
-            local b2 = band(rshift(triple,8),  255)
-            local b3 = band(triple, 255)
+            local c3 = (c3b and c3b~=61) and d[c3b] or nil
+            local c4 = (c4b and c4b~=61) and d[c4b] or nil
+            local triple = (c1<<18) | (c2<<12) | ((c3 or 0)<<6) | (c4 or 0)
+            local b1 = (triple>>16)&255
+            local b2 = (triple>>8) &255
+            local b3 = triple&255
             out[#out+1] = string.char(b1)
             if c3 then out[#out+1] = string.char(b2) end
             if c4 then out[#out+1] = string.char(b3) end
@@ -92,54 +88,54 @@ local B64 = (function()
     return {enc=enc, dec=dec}
 end)()
 
--- TEA (CTR) с bit32
+-- TEA (CTR) на bit32
+local function u32(x) return x & 0xFFFFFFFF end
 local function be_u32(bytes, i)
     local b1,b2,b3,b4 = bytes:byte(i,i+3)
-    return u32(bor(lshift(b1 or 0,24), lshift(b2 or 0,16), lshift(b3 or 0,8), (b4 or 0)))
+    return u32(((b1 or 0)<<24)|((b2 or 0)<<16)|((b3 or 0)<<8)|(b4 or 0))
 end
 local function put_u32_be(x)
-    return string.char(band(rshift(x,24),255), band(rshift(x,16),255), band(rshift(x,8),255), band(x,255))
+    return string.char((x>>24)&255,(x>>16)&255,(x>>8)&255,x&255)
 end
 
 local function tea_key_from_string(s)
     local b = {s:byte(1,#s)}
     while #b<16 do b[#b+1]=0 end
-    local k1 = u32(bor(lshift(b[1],24), lshift(b[2],16), lshift(b[3],8), (b[4] or 0)))
-    local k2 = u32(bor(lshift(b[5],24), lshift(b[6],16), lshift(b[7],8), (b[8] or 0)))
-    local k3 = u32(bor(lshift(b[9],24), lshift(b[10],16), lshift(b[11],8), (b[12] or 0)))
-    local k4 = u32(bor(lshift(b[13],24), lshift(b[14],16), lshift(b[15],8), (b[16] or 0)))
+    local k1 = u32((b[1]<<24)|(b[2]<<16)|(b[3]<<8)|(b[4] or 0))
+    local k2 = u32((b[5]<<24)|(b[6]<<16)|(b[7]<<8)|(b[8] or 0))
+    local k3 = u32((b[9]<<24)|(b[10]<<16)|(b[11]<<8)|(b[12] or 0))
+    local k4 = u32((b[13]<<24)|(b[14]<<16)|(b[15]<<8)|(b[16] or 0))
     return {k1,k2,k3,k4}
 end
-
 local function tea_encrypt_block(v0,v1,k)
-    local sum, delta = 0, 0x9E3779B9
+    local sum = 0
+    local delta = 0x9E3779B9
     for _=1,32 do
         sum = u32(sum + delta)
-        v0  = u32(v0 + bxor(bxor((lshift(v1,4)+k[1]), (v1 + sum)), (rshift(v1,5)+k[2])))
-        v1  = u32(v1 + bxor(bxor((lshift(v0,4)+k[3]), (v0 + sum)), (rshift(v0,5)+k[4])))
+        v0  = u32(v0 + bit32.bxor(bit32.bxor((bit32.lshift(v1,4)+k[1]), (v1 + sum)), (bit32.rshift(v1,5)+k[2])))
+        v1  = u32(v1 + bit32.bxor(bit32.bxor((bit32.lshift(v0,4)+k[3]), (v0 + sum)), (bit32.rshift(v0,5)+k[4])))
     end
     return v0,v1
 end
-
 local function tea_keystream_block(key, nonce8, counter)
+    -- nonce8 (8 байт) + counter (8 байт) -> 16 байт -> 2 u32 из первых 8 и 2 из последних 8
     local n0 = be_u32(nonce8,1)
     local n1 = be_u32(nonce8,5)
-    local c0 = u32(rshift(counter,32))
-    local c1 = u32(band(counter, 0xFFFFFFFF))
+    local c0 = u32(bit32.rshift(counter,32))
+    local c1 = u32(counter & 0xFFFFFFFF)
     local blk = put_u32_be(n0)..put_u32_be(n1)..put_u32_be(c0)..put_u32_be(c1)
     local v0 = be_u32(blk,1)
     local v1 = be_u32(blk,5)
     local y0,y1 = tea_encrypt_block(v0,v1,key)
+    -- возьмём нижние 8 байт y0,y1
     return put_u32_be(y0)..put_u32_be(y1)
 end
-
 local function guid8()
     local g = HttpService:GenerateGUID(false):gsub("-",""):sub(1,16)
     local out={}
     for i=1,#g,2 do out[#out+1]=string.char(tonumber(g:sub(i,i+1),16) or 0) end
     return table.concat(out)
 end
-
 local function tea_encrypt_bytes(plain, keyStr)
     local key = tea_key_from_string(keyStr)
     local nonce = guid8()
@@ -149,13 +145,12 @@ local function tea_encrypt_bytes(plain, keyStr)
         local ks = tea_keystream_block(key, nonce, ctr); ctr=ctr+1
         local chunk = plain:sub(i, i+7)
         local x = table.create(#chunk)
-        for j=1,#chunk do x[j]=string.char(bxor(chunk:byte(j), ks:byte(j))) end
+        for j=1,#chunk do x[j]=string.char(bit32.bxor(chunk:byte(j), ks:byte(j))) end
         out[#out+1]=table.concat(x)
         i=i+8
     end
     return B64.enc(table.concat(out))
 end
-
 local function tea_decrypt_bytes(b64, keyStr)
     local data = B64.dec(b64 or "")
     if #data < 8 then return nil end
@@ -168,7 +163,7 @@ local function tea_decrypt_bytes(b64, keyStr)
         local ks = tea_keystream_block(key, nonce, ctr); ctr=ctr+1
         local chunk = cipher:sub(i, i+7)
         local x = table.create(#chunk)
-        for j=1,#chunk do x[j]=string.char(bxor(chunk:byte(j), ks:byte(j))) end
+        for j=1,#chunk do x[j]=string.char(bit32.bxor(chunk:byte(j), ks:byte(j))) end
         out[#out+1]=table.concat(x)
         i=i+8
     end
@@ -190,6 +185,7 @@ local Config = {}
 function Config.Save(tbl)
     ensureDir()
     if not hasFS() then return false end
+    -- encrypted path
     local ok = pcall(function()
         local plain = HttpService:JSONEncode({
             MinMS         = tonumber(tbl.MinMS) or 0,
@@ -202,6 +198,7 @@ function Config.Save(tbl)
         writefile(CFG_BIN, blob)
     end)
     if ok then return true end
+    -- fallback text
     pcall(makefolder, CFG_DIR)
     pcall(writefile, CFG_TXT, compact_text(tbl))
     return false
@@ -385,13 +382,6 @@ local function setBlur(e)
 end
 
 -- ==== Root GUI ====
-local function getGuiParent()
-    local okH, hui = pcall(function() return gethui and gethui() end)
-    if okH and hui then return hui end
-    local okC, core = pcall(function() return game:GetService("CoreGui") end)
-    if okC then return core end
-    return Players.LocalPlayer:WaitForChild("PlayerGui")
-end
 local parent = getGuiParent()
 local gui=Instance.new("ScreenGui"); gui.Name="FloppaAutoJoinerGui"; gui.IgnoreGuiInset=true; gui.ResetOnSpawn=false; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; gui.DisplayOrder=1e6; gui.Parent=parent
 local main=Instance.new("Frame"); main.Name="Main"; main.Size=UDim2.new(0,980,0,560); main.Position=UDim2.new(0.5,-490,0.5,-280)
@@ -460,6 +450,7 @@ local LOADING=true
 local function strToList(s) local t={} for tok in string.gmatch(s or "", "([^,%s]+)") do t[#t+1]=tok end return t end
 local function listToStr(t) return table.concat(t or {}, ",") end
 
+-- apply config visually (instant)
 local function applyConfigVisual()
     applyAutoJoin(State.AutoJoin, true)
     applyAutoInject(State.AutoInject, true)
@@ -469,6 +460,7 @@ local function applyConfigVisual()
     ignoreBox.Text = listToStr(State.IgnoreNames)
 end
 
+-- Load config
 do
     local cfg = Config.Load()
     if cfg then
@@ -495,6 +487,7 @@ local function saveNow()
     })
 end
 
+-- React on changes → save
 autoJoin.Changed      = function(v) State.AutoJoin = v; saveNow() end
 autoInject.Changed    = function(v) State.AutoInject = v; saveNow() end
 ignoreToggle.Changed  = function(v) State.IgnoreEnabled = v; saveNow() end
@@ -536,6 +529,7 @@ local function queueReinject(url)
     if q and url~="" then q(makeBootstrap(url)) end
 end
 
+-- Если автоинжект включён — сразу ставим очередь на будущий телепорт
 if State.AutoInject then queueReinject(AUTO_INJECT_URL) end
 Players.LocalPlayer.OnTeleport:Connect(function(st)
     if State.AutoInject and st==Enum.TeleportState.Started then
