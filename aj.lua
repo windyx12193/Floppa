@@ -1,39 +1,37 @@
 --[[
-  FLOPPA AUTO JOINER v5.0 (networked)
+  FLOPPA AUTO JOINER v5.1 (networked + dedupe by job_id)
+  • Тянет лобби с твоего бэкенда, парсит HTML/текст, рендерит список
+  • Дедупликация по JOB_ID -> оставляем запись с максимальным $/s
+  • JOIN с ретраями (10/сек), автоочистка старых > 180с, визуальная свежесть
   • Хоткей: T, JSON-конфиг как в v4.7
-  • Подтягивает список лобби с твоего бэкенда и рендерит в AVAILABLE LOBBIES
-  • Формат: NAME | **$X/s** | **P/M** | JOB_ID | TIMESTAMP
-  • JOIN: TeleportService:TeleportToPlaceInstance(PLACE_ID, JOB_ID, LocalPlayer)
-  • JOIN RETRY: число повторов, частота 10/сек (0.1s между попытками)
-  • Очистка «старых» лобби: всё что старше 180 сек удаляется, «свежие» подсвечены, «стареющие» немного тускнеют
 ]]
 
 ---------------- USER/API SETTINGS ----------------
-local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
-local FIXED_HOTKEY    = Enum.KeyCode.T
-local SETTINGS_PATH   = "floppa_aj_settings.json"
+local AUTO_INJECT_URL   = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
+local FIXED_HOTKEY      = Enum.KeyCode.T
+local SETTINGS_PATH     = "floppa_aj_settings.json"
 
 -- API источник
 local SERVER_URL = "https://server-eta-two-29.vercel.app/"
 local API_KEY    = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
 
 -- игру куда телепортируем
-local TARGET_PLACE_ID = 109983668079237
+local TARGET_PLACE_ID   = 109983668079237
 
 -- частота опроса и устаревание
 local PULL_INTERVAL_SEC = 2.0
-local ENTRY_TTL_SEC     = 180.0  -- 3 минуты
-local FRESH_AGE_SEC     = 12.0   -- пока что считаем «новым» (для подсветки)
-
+local ENTRY_TTL_SEC     = 180.0   -- 3 минуты
+local FRESH_AGE_SEC     = 12.0
 ---------------------------------------------------
 
 -- ====== Services / FS / JSON ======
-local Players      = game:GetService("Players")
-local UIS          = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local Lighting     = game:GetService("Lighting")
-local HttpService  = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
+local Players, UIS, TweenService, Lighting, HttpService, TeleportService =
+      game:GetService("Players"),
+      game:GetService("UserInputService"),
+      game:GetService("TweenService"),
+      game:GetService("Lighting"),
+      game:GetService("HttpService"),
+      game:GetService("TeleportService")
 
 local function hasFS()
     return typeof(writefile)=="function" and typeof(readfile)=="function" and typeof(isfile)=="function"
@@ -77,7 +75,7 @@ local State = {
     AutoInject    = false,
     IgnoreEnabled = false,
     JoinRetry     = 50,
-    MinMS         = 100,
+    MinMS         = 100,  -- трактуем как «100K/s» (см. фильтр)
     IgnoreNames   = {}
 }
 do
@@ -252,7 +250,7 @@ jrBox.FocusLost:Connect(function() State.JoinRetry=tonumber(jrBox.Text) or State
 msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; saveSettings() end)
 ignoreState.Changed  = function(txt) State.IgnoreNames=parseIgnore(txt); saveSettings() end
 
--- ====== AutoInject queue (как в v4.7) ======
+-- ====== AutoInject (очередь) ======
 local function pickQueue()
     local q=nil
     pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end)
@@ -287,59 +285,30 @@ Players.LocalPlayer.OnTeleport:Connect(function(st)
 end)
 
 -- ====== Network parsing / rendering ======
+local multipliers = {K=1e3, M=1e6, B=1e9, T=1e12}
+local function parseMoney(text)
+    text = tostring(text or ""):upper()
+    local num, unit = text:match("%$%s*([%d%.]+)%s*([KMBT]?)%s*/%s*S")
+    if not num then return 0 end
+    local n = tonumber(num) or 0
+    local mul = multipliers[unit or ""] or 1
+    return math.floor(n * mul + 0.5)
+end
 
-local function buildURL()
-    -- если у тебя не корневой путь — замени здесь, напр. SERVER_URL.."api/list?key="..API_KEY
+local function buildURL(withKey)
+    if withKey == false then return SERVER_URL end
     local sep = SERVER_URL:find("?") and "&" or "?"
     return SERVER_URL .. sep .. "key=" .. tostring(API_KEY)
 end
 
--- "$780K/s" -> 780000; "$1.2M/s" -> 1200000; "$1.5B/s" -> 1500000000
-local multipliers = {K=1e3, M=1e6, B=1e9, T=1e12}
-local function parseMoney(text)
-    text = tostring(text or ""):upper()
-    local num, unit = text:match("%$%s*([%d%.]+)%s*([KMBT]?)%s*/S")
-    num = tonumber(num or "0") or 0
-    local mul = unit and multipliers[unit] or 1
-    return math.floor(num * mul + 0.5)
+-- MIN M/S трактуем как «в тысячах»: 100 => 100K/s
+local function minThreshold()
+    local v = tonumber(msBox.Text) or State.MinMS or 0
+    return v * 1e3
 end
-
--- строка в формате: name | **$X/s** | **p/m** | job | ts
-local function parseLine(line)
-    local parts = {}
-    for token in tostring(line):gmatch("([^|]+)") do
-        parts[#parts+1] = (token:gsub("^%s+",""):gsub("%s+$",""))
-    end
-    if #parts < 5 then return nil end
-    local name = parts[1]
-    local moneyStr = parts[2]  -- **$780K/s**
-    local playersStr = parts[3] -- **6/8**
-    local jobId = parts[4]
-    local ts = parts[5]        -- текстовая дата, можно не парсить
-
-    local pNow, pMax = playersStr:match("%*%*(%d+)%s*/%s*(%d+)%*%*")
-    if not pNow then pNow, pMax = playersStr:match("(%d+)%s*/%s*(%d+)") end
-    pNow = tonumber(pNow or "0") or 0
-    pMax = tonumber(pMax or "0") or 0
-
-    local mps = parseMoney(moneyStr)
-
-    return {
-        name = name,
-        moneyStr = (moneyStr:gsub("%*","")),
-        mps = mps,
-        players = pNow,
-        max = pMax,
-        jobId = jobId,
-        ts = ts
-    }
-end
-
--- хранение и UI-элементы
-local Entries = {}   -- by jobId -> {data, frame, firstSeen, lastSeen}
-local Order = {}     -- массив jobIds (для сортировки)
 
 local function visibleByFilters(d)
+    if d.mps < minThreshold() then return false end
     if State.IgnoreEnabled then
         for _,nm in ipairs(State.IgnoreNames) do
             if #nm>0 and d.name:lower():find(nm:lower(),1,true) then
@@ -347,16 +316,16 @@ local function visibleByFilters(d)
             end
         end
     end
-    if d.mps < (tonumber(msBox.Text) or State.MinMS)*1000 then
-        -- ВАЖНО: msBox — это «мин/мс» в текстовом виде: если пользователь вводит "100", это 100K/s?
-        -- Мы трактуем как $/s в ЧИСЛЕ, поэтому умножаем на 1000 (K). При желании убери "*1000".
-    end
-    return d.mps >= ((tonumber(msBox.Text) or State.MinMS) * 1000)
+    return true
 end
 
 local function formatPlayers(p,m)
     return string.format("%d/%d", p or 0, m or 0)
 end
+
+-- UI storage
+local Entries = {}   -- jobId -> {data, frame, firstSeen, lastSeen}
+local Order   = {}   -- порядок отображения
 
 local function ensureEntryFrame(jobId, data)
     local e = Entries[jobId]
@@ -368,7 +337,7 @@ local function ensureEntryFrame(jobId, data)
     local nameLbl=mkLabel(item, string.upper(data.name), 18, "bold", COLORS.textPrimary)
     nameLbl.Size=UDim2.new(0.44,-10,1,0)
 
-    local moneyLbl=mkLabel(item, string.upper((data.moneyStr or "")), 17, "medium", Color3.fromRGB(130,255,130))
+    local moneyLbl=mkLabel(item, string.upper(data.moneyStr or ""), 17, "medium", Color3.fromRGB(130,255,130))
     moneyLbl.AnchorPoint=Vector2.new(0,0.5); moneyLbl.Position=UDim2.new(0.46,0,0.5,0)
     moneyLbl.Size=UDim2.new(0.22,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Left
 
@@ -381,19 +350,17 @@ local function ensureEntryFrame(jobId, data)
     roundify(joinBtn,10); stroke(joinBtn, Color3.fromRGB(0,0,0), 1, 0.7); joinBtn.Parent=item
 
     joinBtn.MouseButton1Click:Connect(function()
-        -- ограниченная по времени серия попыток: State.JoinRetry, 10/сек
         local tries = tonumber(jrBox.Text) or State.JoinRetry or 0
         local delaySec = 0.10
         joinBtn.Text = "JOIN…"
         for i=1, math.max(tries,1) do
-            local ok, tpErr = pcall(function()
+            local ok = pcall(function()
                 TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, Players.LocalPlayer)
             end)
             if ok then
                 joinBtn.Text = "OK"
                 break
             else
-                -- если сервер полон/ошибка — просто ждём и пробуем снова
                 joinBtn.Text = ("RETRY %d/%d"):format(i, tries)
                 task.wait(delaySec)
             end
@@ -401,7 +368,7 @@ local function ensureEntryFrame(jobId, data)
         task.delay(0.8, function() if joinBtn then joinBtn.Text="JOIN" end end)
     end)
 
-    if not e then Entries[jobId] = {data=data, frame=item, firstSeen=os.clock(), lastSeen=os.clock()} end
+    Entries[jobId] = {data=data, frame=item, firstSeen=os.clock(), lastSeen=os.clock()}
     return item
 end
 
@@ -409,20 +376,22 @@ local function updateEntry(jobId, data)
     local e = Entries[jobId]
     if not e then
         ensureEntryFrame(jobId, data)
-        e = Entries[jobId]
         table.insert(Order, jobId)
+        e = Entries[jobId]
     else
-        e.data = data
-        e.lastSeen = os.clock()
-        -- обновим текст
-        local item = e.frame
-        if item and item.Parent then
-            local kids = item:GetChildren()
-            -- 1: name, 2: money, 3: players, 4: button (по созданию выше)
-            if kids[1] and kids[1].ClassName=="TextLabel" then kids[1].Text = string.upper(data.name) end
-            if kids[2] and kids[2].ClassName=="TextLabel" then kids[2].Text = string.upper((data.moneyStr or "")) end
-            if kids[3] and kids[3].ClassName=="TextLabel" then kids[3].Text = formatPlayers(data.players, data.max) end
+        -- если пришла ещё одна запись с тем же jobId, оставляем самую прибыльную
+        if data.mps > (e.data.mps or 0) then
+            e.data = data
         end
+        e.lastSeen = os.clock()
+    end
+    -- обновить тексты
+    local item = e.frame
+    if item and item.Parent then
+        local kids = item:GetChildren()
+        if kids[1] and kids[1].ClassName=="TextLabel" then kids[1].Text = string.upper(e.data.name) end
+        if kids[2] and kids[2].ClassName=="TextLabel" then kids[2].Text = string.upper(e.data.moneyStr or "") end
+        if kids[3] and kids[3].ClassName=="TextLabel" then kids[3].Text = formatPlayers(e.data.players, e.data.max) end
     end
 end
 
@@ -435,7 +404,6 @@ local function removeEntry(jobId)
 end
 
 local function refreshListVisual()
-    -- сортируем: сперва по mps (по убыв.), затем по свежести
     table.sort(Order, function(a,b)
         local ea, eb = Entries[a], Entries[b]
         if not ea or not eb then return a<b end
@@ -446,12 +414,10 @@ local function refreshListVisual()
         local e = Entries[jobId]
         if e and e.frame and e.frame.Parent == scroll then
             e.frame.LayoutOrder = idx
-            -- свежесть: новая — легкая зелёная подсветка, старая — немного темнее
             local age = os.clock() - e.firstSeen
-            local alpha = 0.0
             if age <= FRESH_AGE_SEC then
-                alpha = 0.0
-                e.frame.BackgroundColor3 = Color3.fromRGB(22, 28, 26) -- чуть зеленит фон для «новых»
+                e.frame.BackgroundColor3 = Color3.fromRGB(22, 28, 26)
+                e.frame.BackgroundTransparency = ALPHA.panel
             else
                 e.frame.BackgroundColor3 = COLORS.surface
                 local staleness = math.clamp((os.clock()-e.lastSeen)/ENTRY_TTL_SEC, 0, 1)
@@ -462,39 +428,79 @@ local function refreshListVisual()
     task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
 end
 
-local function parseAll(text)
+-- парсер одной строки
+local function parseLine(line)
+    line = tostring(line or "")
+    line = line:gsub("%*%*", ""):gsub("\t"," ")
+    local parts = {}
+    for token in line:gmatch("([^|]+)") do
+        parts[#parts+1] = (token:gsub("^%s+",""):gsub("%s+$",""))
+    end
+    if #parts < 5 then return nil end
+    local name, moneyStr, playersStr, jobId, ts =
+          parts[1], parts[2], parts[3], parts[4], parts[5]
+    local pNow, pMax = playersStr:match("(%d+)%s*/%s*(%d+)")
+    pNow = tonumber(pNow or "0") or 0
+    pMax = tonumber(pMax or "0") or 0
+    local mps = parseMoney(moneyStr)
+    return {
+        name = name, moneyStr = moneyStr, mps = mps,
+        players = pNow, max = pMax, jobId = jobId, ts = ts
+    }
+end
+
+-- парс всего ответа: чистим HTML и режем по строкам; дедуп по jobId с max mps
+local function parseAll(raw)
+    local body = tostring(raw or "")
+    body = body:gsub("\r\n","\n")
+               :gsub("<[Bb][Rr]%s*/?>","\n")
+               :gsub("</?%w+[^>]*>","")
+               :gsub("&nbsp;"," ")
     local now = os.clock()
-    for line in tostring(text or ""):gmatch("(.-)\n") do
+
+    -- временный буфер best[jobId] = bestData
+    local best = {}
+    for line in (body.."\n"):gmatch("(.-)\n") do
         if line:match("%S") then
             local d = parseLine(line)
-            if d then
-                if visibleByFilters(d) then
-                    updateEntry(d.jobId, d)
+            if d and visibleByFilters(d) then
+                local cur = best[d.jobId]
+                if not cur or d.mps > cur.mps then
+                    best[d.jobId] = d
                 end
             end
         end
     end
+
+    -- применяем буфер в Entries
+    for jobId, d in pairs(best) do
+        updateEntry(jobId, d)
+    end
+
     -- чистим устаревшие
     for jobId, e in pairs(Entries) do
         if (now - e.lastSeen) > ENTRY_TTL_SEC then
             removeEntry(jobId)
         end
     end
+
     refreshListVisual()
 end
 
+-- запрос с fallback (с ключом/без ключа)
 local function pullOnce()
-    local url = buildURL()
-    local ok, body = pcall(function() return game:HttpGet(url) end)
+    local ok, body = pcall(function() return game:HttpGet(buildURL(true)) end)
+    if not ok or type(body)~="string" or #body==0 then
+        ok, body = pcall(function() return game:HttpGet(buildURL(false)) end)
+    end
     if ok and type(body)=="string" and #body>0 then
-        parseAll(body.."\n") -- гарантируем финальный \n
+        parseAll(body)
     end
 end
 
 -- ====== Poll loop ======
 task.spawn(function()
     while gui and gui.Parent do
-        -- фильтры могли измениться → лёгкая ресинхронизация:
         pullOnce()
         task.wait(PULL_INTERVAL_SEC)
     end
