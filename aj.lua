@@ -1,323 +1,416 @@
 --[[
-  Floppa Config Manager (TEA encrypt, compact fallback)
-  Поля:
-    MinMS            (number)
-    AutoJoin         (boolean)
-    JoinRetry        (number)
-    IgnoreEnabled    (boolean)
-    IgnoreNames      (table of strings) -> 'name1,name2,...'
-  Файлы:
-    workspace/.floppa_cfg/config.bin  (зашифровано TEA + Base64)
-    workspace/.floppa_cfg/config.txt  (минимальный текст, если нет FS/ошибка)
+  FLOPPA AUTO JOINER v5 (stable)
+  • Фиолетовый GUI, лёгкий блюр, фиксированный хоткей T
+  • AUTO INJECT: очередь на телепорт + keep-alive каждые 5с + повтор при Teleport
+  • Локальный конфиг: workspace/.floppa_aj/config.txt (минимальный текст)
+  • Максимальная совместимость: без bit32/шифрования и двусмысленного синтаксиса
 ]]
 
------------------- ПУТЬ К ФАЙЛАМ ------------------
-local DIR   = "workspace/.floppa_cfg"   -- не «Загрузки» и не «Рабочий стол»
-local BIN   = DIR .. "/config.bin"
-local TXT   = DIR .. "/config.txt"
+---------------- USER SETTINGS ----------------
+local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
+local FIXED_HOTKEY    = Enum.KeyCode.T
+------------------------------------------------
 
------------------- КЛЮЧ ШИФРОВАНИЯ ----------------
--- Поменяй строку, если хочешь свой ключ (длина любая; берутся первые 16 байт)
-local SECRET = "floppa_secure_key_v2"
+local function log(...) print("[Floppa]", ...) end
+local function err(...) warn("[Floppa][ERR]", ...) end
 
------------------- HELPERS: FS ---------------------
-local HttpService = game:GetService("HttpService")
+local ok_main, topErr = pcall(function()
+    -- ==== Services ====
+    local Players      = game:GetService("Players")
+    local UIS          = game:GetService("UserInputService")
+    local TweenService = game:GetService("TweenService")
+    local Lighting     = game:GetService("Lighting")
 
-local function hasFS()
-    return typeof(writefile)=="function"
-       and typeof(readfile)=="function"
-       and typeof(isfile)=="function"
-       and typeof(makefolder)=="function"
-end
+    -- =================================================================================
+    -- CONFIG (plain text, maximum compatibility)
+    -- =================================================================================
+    local CFG_DIR = "workspace/.floppa_aj"
+    local CFG_TXT = CFG_DIR .. "/config.txt"
 
-local function ensureDir()
-    if hasFS() then pcall(makefolder, DIR) end
-end
-
------------------- HELPERS: Base64 ----------------
-local B64 = (function()
-    local enc_tbl = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-    local dec_tbl = {}
-    for i=1,#enc_tbl do dec_tbl[string.byte(enc_tbl,i)] = i-1 end
-    local function encode(data)
-        local bytes = {string.byte(data,1,#data)}
-        local out, n = {}, #bytes
-        local i=1
-        while i<=n do
-            local b1 = bytes[i]   or 0; i=i+1
-            local b2 = bytes[i]   or 0; i=i+1
-            local b3 = bytes[i]   or 0; i=i+1
-            local triple = b1*65536 + b2*256 + b3
-            local c1 = math.floor(triple/262144) % 64
-            local c2 = math.floor(triple/4096)   % 64
-            local c3 = math.floor(triple/64)     % 64
-            local c4 = triple % 64
-            local p3 = (i-1>n+1)  -- сколько «пустых» байтов
-            local p4 = (i-1>n)
-            out[#out+1] = string.sub(enc_tbl,c1+1,c1+1)
-            out[#out+1] = string.sub(enc_tbl,c2+1,c2+1)
-            out[#out+1] = p3 and '=' or string.sub(enc_tbl,c3+1,c3+1)
-            out[#out+1] = p4 and '=' or string.sub(enc_tbl,c4+1,c4+1)
-        end
-        return table.concat(out)
+    local function hasFS()
+        return typeof(writefile)=="function"
+            and typeof(readfile)=="function"
+            and typeof(isfile)=="function"
+            and typeof(makefolder)=="function"
     end
-    local function decode(data)
-        local out, bytes, n = {}, {string.byte(data,1,#data)}, #data
-        local i=1
-        while i<=n do
-            local c1 = dec_tbl[bytes[i]];   i=i+1
-            local c2 = dec_tbl[bytes[i]];   i=i+1
-            local c3b= bytes[i];            i=i+1
-            local c4b= bytes[i];            i=i+1
-            if not c1 or not c2 then break end
-            local c3 = (c3b and c3b~=61) and dec_tbl[c3b] or nil
-            local c4 = (c4b and c4b~=61) and dec_tbl[c4b] or nil
-            local triple = (c1<<18) | (c2<<12) | ((c3 or 0)<<6) | (c4 or 0)
-            local b1 = (triple>>16) & 255
-            local b2 = (triple>>8)  & 255
-            local b3 = triple       & 255
-            out[#out+1] = string.char(b1)
-            if c3 then out[#out+1] = string.char(b2) end
-            if c4 then out[#out+1] = string.char(b3) end
-        end
-        return table.concat(out)
+
+    if hasFS() then pcall(makefolder, CFG_DIR) end
+
+    local function cfg_compose(cfg)
+        return table.concat({
+            "MIN M/S = "..tostring(cfg.MinMS or 0),
+            "A/J = "..tostring(cfg.AutoJoin and true or false),
+            "JOIN RETRY = "..tostring(cfg.JoinRetry or 0),
+            "ENABLE IGNORE LIST = "..tostring(cfg.IgnoreEnabled and true or false),
+            "IGNORE NAMES ='"..table.concat(cfg.IgnoreNames or {}, ",").."'",
+            "AUTO INJECT = "..tostring(cfg.AutoInject and true or false),
+            ""
+        },"\n")
     end
-    return {enc=encode, dec=decode}
-end)()
 
------------------- HELPERS: TEA -------------------
--- Классический TEA: 64-битный блок, 128-битный ключ, 32 раунда.
--- Режим: CTR (счётчик), так что нет паддингов и можно шифровать любой размер.
-local TEA = {}
-
-local function to_u32(x) return x & 0xFFFFFFFF end
-local function pack_u32_be(a,b,c,d)
-    return string.char(
-        (a>>24)&255, (a>>16)&255, (a>>8)&255, a&255,
-        (b>>24)&255, (b>>16)&255, (b>>8)&255, b&255,
-        (c>>24)&255, (c>>16)&255, (c>>8)&255, c&255,
-        (d>>24)&255, (d>>16)&255, (d>>8)&255, d&255
-    )
-end
-local function unpack_u32_be(s, i)
-    local b1,b2,b3,b4 = s:byte(i,i+3)
-    return ((b1<<24)|(b2<<16)|(b3<<8)|b4) & 0xFFFFFFFF
-end
-
-function TEA.keyFromString(str)
-    -- первые 16 байт -> 4 u32
-    local b = {string.byte(str,1,#str)}
-    while #b<16 do b[#b+1]=0 end
-    local k1 = ((b[1] <<24)|(b[2] <<16)|(b[3] <<8)| (b[4] or 0)) & 0xFFFFFFFF
-    local k2 = ((b[5] <<24)|(b[6] <<16)|(b[7] <<8)| (b[8] or 0)) & 0xFFFFFFFF
-    local k3 = ((b[9] <<24)|(b[10]<<16)|(b[11]<<8)| (b[12] or 0))& 0xFFFFFFFF
-    local k4 = ((b[13]<<24)|(b[14]<<16)|(b[15]<<8)| (b[16] or 0))& 0xFFFFFFFF
-    return {k1,k2,k3,k4}
-end
-
-function TEA.encryptBlock(v0,v1,key)
-    local sum=0; local delta=0x9E3779B9
-    local k1,k2,k3,k4 = key[1],key[2],key[3],key[4]
-    for _=1,32 do
-        sum = to_u32(sum + delta)
-        v0  = to_u32(v0 + (((v1<<4)+k1) ~ (v1 + sum) ~ ((v1>>5) + k2)))
-        v1  = to_u32(v1 + (((v0<<4)+k3) ~ (v0 + sum) ~ ((v0>>5) + k4)))
-    end
-    return v0,v1
-end
-
--- CTR-поток: шифруем счётчик, затем XOR с данными
-local function tea_keystream(key, nonce, counter)
-    -- nonce: 8 байт, counter: 8 байт -> 16 байт -> 2x u32
-    local v0 = unpack_u32_be(nonce,1)
-    local v1 = unpack_u32_be(nonce,5)
-    -- "counter" как 64-бит: high,low
-    local c0 = (counter>>32) & 0xFFFFFFFF
-    local c1 = counter & 0xFFFFFFFF
-    local b  = pack_u32_be(v0, v1, c0, c1)
-    local x0 = unpack_u32_be(b,1)
-    local x1 = unpack_u32_be(b,5)
-    local y0,y1 = TEA.encryptBlock(x0,x1,key)
-    return pack_u32_be(0,0,y0,y1)  -- берём 8 байт keystream (нижние)
-end
-
-local function secureRandom8()
-    -- простой nonce: GUID -> берём 8 байт
-    local g = HttpService:GenerateGUID(false) -- "xxxxxxxx-xxxx-..."
-    -- уберём дефисы, возьмём первые 16 hex -> 8 байт
-    local hex = g:gsub("-", ""):sub(1,16)
-    local out = {}
-    for i=1,#hex,2 do
-        local byte = tonumber(hex:sub(i,i+1),16) or 0
-        out[#out+1] = string.char(byte)
-    end
-    return table.concat(out)
-end
-
-local function tea_encrypt_bytes(plain, keyStr)
-    local key = TEA.keyFromString(keyStr)
-    local nonce = secureRandom8()
-    local out = {nonce} -- сохраним nonce в начале
-    local counter = 0
-    local i=1
-    while i<=#plain do
-        local ks = tea_keystream(key, nonce, counter)
-        counter = counter + 1
-        local chunk = plain:sub(i, i+7)
-        local xored = table.create(#chunk)
-        for j=1,#chunk do
-            xored[j] = string.char( (chunk:byte(j) ~ ks:byte(j)) & 255 )
-        end
-        out[#out+1] = table.concat(xored)
-        i = i + 8
-    end
-    return B64.enc(table.concat(out))
-end
-
-local function tea_decrypt_bytes(b64, keyStr)
-    local data = B64.dec(b64 or "")
-    if #data < 8 then return nil end
-    local nonce = data:sub(1,8)
-    local cipher= data:sub(9)
-    local key   = TEA.keyFromString(keyStr)
-    local out   = {}
-    local counter=0
-    local i=1
-    while i<=#cipher do
-        local ks = tea_keystream(key, nonce, counter)
-        counter = counter + 1
-        local chunk = cipher:sub(i, i+7)
-        local xored = table.create(#chunk)
-        for j=1,#chunk do
-            xored[j] = string.char( (chunk:byte(j) ~ ks:byte(j)) & 255 )
-        end
-        out[#out+1] = table.concat(xored)
-        i = i + 8
-    end
-    return table.concat(out)
-end
-
------------------- API: SAVE / LOAD ----------------
-local function compactText(cfg)
-    -- Минимальный формат из твоего примера
-    return table.concat({
-        "MIN M/S = "..tostring(cfg.MinMS or 0),
-        "A/J = "..tostring(cfg.AutoJoin and true or false),
-        "JOIN RETRY = "..tostring(cfg.JoinRetry or 0),
-        "ENABLE IGNORE LIST = "..tostring(cfg.IgnoreEnabled and true or false),
-        "IGNORE NAMES ='"..table.concat(cfg.IgnoreNames or {}, ",").."'",  -- одинарные кавычки
-        ""
-    },"\n")
-end
-
-local Config = {}
-
-function Config.Save(cfg)
-    ensureDir()
-    if not hasFS() then
-        -- Нет доступа к FS — ничего не делаем
-        return false, "no-fs"
-    end
-    -- Пытаемся сохранить зашифровано
-    local okEnc, err = pcall(function()
-        local plain = HttpService:JSONEncode({
-            MinMS         = tonumber(cfg.MinMS) or 0,
-            AutoJoin      = cfg.AutoJoin and true or false,
-            JoinRetry     = tonumber(cfg.JoinRetry) or 0,
-            IgnoreEnabled = cfg.IgnoreEnabled and true or false,
-            IgnoreNames   = cfg.IgnoreNames or {},
-        })
-        local blob = tea_encrypt_bytes(plain, SECRET)
-        writefile(BIN, blob)
-    end)
-    if okEnc then return true end
-
-    -- На крайний случай — компактный текст (как просил)
-    pcall(function()
-        writefile(TXT, compactText(cfg))
-    end)
-    return false, "enc-fallback"
-end
-
-function Config.Load()
-    if not hasFS() then return nil, "no-fs" end
-    -- Сначала пытаемся прочитать зашифрованный бинарник
-    if isfile(BIN) then
-        local ok, data = pcall(readfile, BIN)
-        if ok and type(data)=="string" and #data>0 then
-            local dec = tea_decrypt_bytes(data, SECRET)
-            if dec then
-                local ok2, tbl = pcall(function() return HttpService:JSONDecode(dec) end)
-                if ok2 and type(tbl)=="table" then
-                    -- нормализуем
-                    tbl.MinMS         = tonumber(tbl.MinMS) or 0
-                    tbl.AutoJoin      = tbl.AutoJoin and true or false
-                    tbl.JoinRetry     = tonumber(tbl.JoinRetry) or 0
-                    tbl.IgnoreEnabled = tbl.IgnoreEnabled and true or false
-                    if type(tbl.IgnoreNames)~="table" then tbl.IgnoreNames = {} end
-                    return tbl
+    local function cfg_parse(txt)
+        local cfg = {MinMS=100, AutoJoin=false, JoinRetry=50, IgnoreEnabled=false, IgnoreNames={}, AutoInject=false}
+        for line in (txt.."\n"):gmatch("(.-)\n") do
+            local k,v = line:match("^%s*([%w%s/]+)%s*=%s*(.-)%s*$")
+            if k and v then
+                k = k:gsub("%s+"," "):upper()
+                if k=="MIN M/S" then
+                    cfg.MinMS = tonumber(v) or cfg.MinMS
+                elseif k=="A/J" then
+                    cfg.AutoJoin = (v=="true" or v=="True")
+                elseif k=="JOIN RETRY" then
+                    cfg.JoinRetry = tonumber(v) or cfg.JoinRetry
+                elseif k=="ENABLE IGNORE LIST" then
+                    cfg.IgnoreEnabled = (v=="true" or v=="True")
+                elseif k=="IGNORE NAMES" then
+                    local s = v:gsub("^'%s*", ""):gsub("%s*'$", "")
+                    cfg.IgnoreNames = {}
+                    for tok in s:gmatch("([^,%s]+)") do cfg.IgnoreNames[#cfg.IgnoreNames+1]=tok end
+                elseif k=="AUTO INJECT" then
+                    cfg.AutoInject = (v=="true" or v=="True")
                 end
             end
         end
+        return cfg
     end
-    -- Иначе — прочитаем компактный текст (fallback)
-    if isfile(TXT) then
-        local ok, data = pcall(readfile, TXT)
-        if ok and type(data)=="string" then
-            local cfg = {
-                MinMS=0, AutoJoin=false, JoinRetry=0, IgnoreEnabled=false, IgnoreNames={}
-            }
-            for line in (data.."\n"):gmatch("(.-)\n") do
-                local k,v = line:match("^%s*([%w%s/]+)%s*=%s*(.-)%s*$")
-                if k and v then
-                    k = k:gsub("%s+"," "):upper()
-                    if k=="MIN M/S" then cfg.MinMS=tonumber(v) or 0
-                    elseif k=="A/J" then cfg.AutoJoin=(v=="true" or v=="True")
-                    elseif k=="JOIN RETRY" then cfg.JoinRetry=tonumber(v) or 0
-                    elseif k=="ENABLE IGNORE LIST" then cfg.IgnoreEnabled=(v=="true" or v=="True")
-                    elseif k=="IGNORE NAMES" then
-                        local s = v
-                        -- снять одинарные кавычки
-                        s = s:gsub("^'%s*",""):gsub("%s*'$","")
-                        cfg.IgnoreNames = {}
-                        for token in s:gmatch("([^,%s]+)") do
-                            table.insert(cfg.IgnoreNames, token)
-                        end
+
+    local function cfg_save(cfg)
+        if not hasFS() then return false end
+        local ok, e = pcall(writefile, CFG_TXT, cfg_compose(cfg))
+        if not ok then err("writefile:", e) end
+        return ok
+    end
+
+    local function cfg_load()
+        if not hasFS() or not isfile(CFG_TXT) then return nil end
+        local ok, txt = pcall(readfile, CFG_TXT)
+        if not ok or type(txt)~="string" then return nil end
+        return cfg_parse(txt)
+    end
+
+    -- =================================================================================
+    -- GUI helpers / style
+    -- =================================================================================
+    local COLORS = {
+        purpleDeep  = Color3.fromRGB(96, 63, 196),
+        purple      = Color3.fromRGB(134, 102, 255),
+        purpleSoft  = Color3.fromRGB(160, 135, 255),
+        surface     = Color3.fromRGB(18, 18, 22),
+        surface2    = Color3.fromRGB(26, 26, 32),
+        textPrimary = Color3.fromRGB(238, 238, 245),
+        textWeak    = Color3.fromRGB(190, 190, 200),
+        on          = Color3.fromRGB(64, 222, 125),
+        off         = Color3.fromRGB(120, 120, 130),
+        joinBtn     = Color3.fromRGB(67, 232, 113),
+        stroke      = Color3.fromRGB(70, 60, 140)
+    }
+    local ALPHA = { panel = 0.12, card = 0.18 }
+
+    local function roundify(obj, px)
+        local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0, px or 10); c.Parent=obj; return c
+    end
+    local function stroke(obj, col, th, tr)
+        local s=Instance.new("UIStroke"); s.Color=col or COLORS.stroke; s.Thickness=th or 1; s.Transparency=tr or 0.25; s.ApplyStrokeMode=Enum.ApplyStrokeMode.Border; s.Parent=obj; return s
+    end
+    local function padding(obj, l,t,r,b)
+        local p=Instance.new("UIPadding"); p.PaddingLeft=UDim.new(0,l or 0); p.PaddingTop=UDim.new(0,t or 0); p.PaddingRight=UDim.new(0,r or 0); p.PaddingBottom=UDim.new(0,b or 0); p.Parent=obj; return p
+    end
+    local function setFont(lbl, weight)
+        local ok=pcall(function()
+            if weight=="bold" then lbl.Font=Enum.Font.GothamBold
+            elseif weight=="medium" then lbl.Font=Enum.Font.GothamMedium
+            else lbl.Font=Enum.Font.Gotham end
+        end)
+        if not ok then lbl.Font=(weight=="bold") and Enum.Font.SourceSansBold or Enum.Font.SourceSans end
+    end
+    local function mkLabel(parent, text, size, weight, color)
+        local lbl=Instance.new("TextLabel"); lbl.BackgroundTransparency=1; lbl.Text=text; lbl.TextSize=size or 18
+        lbl.TextColor3=color or COLORS.textPrimary; lbl.TextXAlignment=Enum.TextXAlignment.Left; setFont(lbl, weight); lbl.Parent=parent; return lbl
+    end
+    local function mkHeader(parent, text)
+        local h=Instance.new("Frame"); h.BackgroundColor3=COLORS.surface2; h.BackgroundTransparency=ALPHA.card; h.Size=UDim2.new(1,0,0,38); h.Parent=parent
+        roundify(h,8); stroke(h); padding(h,12,6,12,6)
+        local g=Instance.new("UIGradient")
+        g.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,COLORS.purpleDeep),ColorSequenceKeypoint.new(1,COLORS.purple)}
+        g.Transparency=NumberSequence.new{NumberSequenceKeypoint.new(0,0.4),NumberSequenceKeypoint.new(1,0.4)}; g.Rotation=90; g.Parent=h
+        mkLabel(h, text, 18, "bold", COLORS.textPrimary).Size=UDim2.new(1,0,1,0)
+        return h
+    end
+
+    local function mkToggle(parent, text, default)
+        local row=Instance.new("Frame"); row.Name=text.."_Row"; row.BackgroundColor3=COLORS.surface2; row.BackgroundTransparency=ALPHA.card
+        row.Size=UDim2.new(1,0,0,44); row.Parent=parent; roundify(row,10); stroke(row); padding(row,12,0,12,0)
+        mkLabel(row, text, 17, "medium", COLORS.textPrimary).Size=UDim2.new(1,-80,1,0)
+        local sw=Instance.new("TextButton"); sw.Text=""; sw.AutoButtonColor=false; sw.BackgroundColor3=Color3.fromRGB(40,40,48); sw.BackgroundTransparency=0.2
+        sw.Size=UDim2.new(0,62,0,28); sw.AnchorPoint=Vector2.new(1,0.5); sw.Position=UDim2.new(1,-6,0.5,0); sw.Parent=row
+        roundify(sw,14); stroke(sw, COLORS.purpleSoft, 1, 0.35)
+        local dot=Instance.new("Frame"); dot.Size=UDim2.new(0,24,0,24); dot.Position=UDim2.new(0,2,0.5,-12); dot.BackgroundColor3=COLORS.off; dot.Parent=sw; roundify(dot,12)
+        local state={Value=default and true or false, Changed=nil}
+        local function apply(v, instant)
+            state.Value=v
+            local pos = v and UDim2.new(1,-26,0.5,-12) or UDim2.new(0,2,0.5,-12)
+            local col = v and COLORS.on or COLORS.off
+            if instant then
+                dot.Position=pos; dot.BackgroundColor3=col
+                sw.BackgroundColor3 = v and Color3.fromRGB(55,58,74) or Color3.fromRGB(40,40,48)
+            else
+                TweenService:Create(dot, TweenInfo.new(0.13, Enum.EasingStyle.Sine), {Position=pos}):Play()
+                TweenService:Create(dot, TweenInfo.new(0.12, Enum.EasingStyle.Sine), {BackgroundColor3=col}):Play()
+                TweenService:Create(sw,  TweenInfo.new(0.12, Enum.EasingStyle.Sine),
+                    {BackgroundColor3 = v and Color3.fromRGB(55,58,74) or Color3.fromRGB(40,40,48)}):Play()
+            end
+        end
+        apply(state.Value,true)
+        sw.MouseButton1Click:Connect(function()
+            apply(not state.Value,false)
+            if state.Changed then task.defer(function() pcall(state.Changed, state.Value) end) end
+        end)
+        return row, state, apply
+    end
+
+    local function mkStackInput(parent, title, placeholder, defaultText, isNumeric)
+        local row=Instance.new("Frame"); row.Name=title.."_Stacked"; row.BackgroundColor3=COLORS.surface2; row.BackgroundTransparency=ALPHA.card
+        row.Size=UDim2.new(1,0,0,70); row.Parent=parent; roundify(row,10); stroke(row); padding(row,12,8,12,12)
+        mkLabel(row, title, 16, "medium", COLORS.textPrimary).Size=UDim2.new(1,0,0,18)
+        local box=Instance.new("TextBox"); box.PlaceholderText=placeholder or ""; box.Text=defaultText or ""; box.ClearTextOnFocus=false
+        box.TextSize=17; box.TextColor3=COLORS.textPrimary; box.PlaceholderColor3=COLORS.textWeak
+        box.BackgroundColor3=Color3.fromRGB(32,32,38); box.BackgroundTransparency=0.15
+        box.Size=UDim2.new(1,0,0,30); box.Position=UDim2.new(0,0,0,30); roundify(box,8); stroke(box, COLORS.purpleSoft, 1, 0.35); box.Parent=row
+        if isNumeric then box:GetPropertyChangedSignal("Text"):Connect(function() box.Text=box.Text:gsub("[^%d]","") end) end
+        local state={}
+        box.FocusLost:Connect(function()
+            state.Value = isNumeric and (tonumber(box.Text) or 0) or box.Text
+            if state.Changed then pcall(state.Changed, state.Value) end
+        end)
+        return row, state, box
+    end
+
+    local function getGuiParent()
+        local okH, hui = pcall(function() return gethui and gethui() end)
+        if okH and hui then return hui end
+        local okC, core = pcall(function() return game:GetService("CoreGui") end)
+        if okC then return core end
+        return Players.LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    -- cleanup previous instance if exists
+    do
+        local par = getGuiParent()
+        local old = par:FindFirstChild("FloppaAutoJoinerGui")
+        if old then pcall(function() old:Destroy() end) end
+        pcall(function() if getgenv then getgenv().__FLOPPA_UI_ACTIVE=nil end end)
+    end
+
+    -- ==== Blur (light) ====
+    local blur=Lighting:FindFirstChild("FloppaLightBlur") or Instance.new("BlurEffect")
+    blur.Name="FloppaLightBlur"; blur.Size=0; blur.Enabled=false; blur.Parent=Lighting
+    local function setBlur(e)
+        if e then
+            blur.Enabled=true
+            TweenService:Create(blur, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Size=4}):Play()
+        else
+            TweenService:Create(blur, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Size=0}):Play()
+            task.delay(0.16,function() blur.Enabled=false end)
+        end
+    end
+
+    -- =================================================================================
+    -- Build GUI
+    -- =================================================================================
+    local parent = getGuiParent()
+    local gui=Instance.new("ScreenGui"); gui.Name="FloppaAutoJoinerGui"; gui.IgnoreGuiInset=true; gui.ResetOnSpawn=false; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; gui.DisplayOrder=1e6; gui.Parent=parent
+
+    local main=Instance.new("Frame"); main.Name="Main"; main.Size=UDim2.new(0,980,0,560); main.Position=UDim2.new(0.5,-490,0.5,-280)
+    main.BackgroundColor3=COLORS.surface; main.BackgroundTransparency=ALPHA.panel; main.Parent=gui
+    roundify(main,14); stroke(main, COLORS.purpleSoft, 1.5, 0.35); padding(main,10,10,10,10)
+
+    local header=Instance.new("Frame"); header.Size=UDim2.new(1,0,0,48); header.BackgroundColor3=COLORS.surface2; header.BackgroundTransparency=ALPHA.card; header.Parent=main
+    roundify(header,10); stroke(header); padding(header,14,6,14,6)
+    mkLabel(header,"FLOPPA AUTO JOINER v5",20,"bold",COLORS.textPrimary).Size=UDim2.new(0.7,0,1,0)
+    local hk=mkLabel(header,"OPEN GUI KEY:  T",16,"medium",COLORS.textWeak); hk.AnchorPoint=Vector2.new(1,0.5); hk.Position=UDim2.new(1,-14,0.5,0); hk.Size=UDim2.new(0.28,0,1,0); hk.TextXAlignment=Enum.TextXAlignment.Right
+
+    local left=Instance.new("ScrollingFrame"); left.Size=UDim2.new(0,300,1,-58); left.Position=UDim2.new(0,0,0,58); left.BackgroundTransparency=1
+    left.ScrollBarThickness=6; left.ScrollingDirection=Enum.ScrollingDirection.Y; left.CanvasSize=UDim2.new(0,0,0,0); left.Parent=main
+    local leftPad=padding(left,0,0,0,10)
+    local leftList=Instance.new("UIListLayout"); leftList.Padding=UDim.new(0,10); leftList.SortOrder=Enum.SortOrder.LayoutOrder; leftList.Parent=left
+    local function updateLeftCanvas() left.CanvasSize=UDim2.new(0,0,0,leftList.AbsoluteContentSize.Y+leftPad.PaddingBottom.Offset) end
+    leftList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateLeftCanvas)
+
+    local right=Instance.new("Frame"); right.Size=UDim2.new(1,-320,1,-58); right.Position=UDim2.new(0,320,0,58)
+    right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card; right.Parent=main
+    roundify(right,12); stroke(right); padding(right,12,12,12,12)
+
+    -- Left controls
+    mkHeader(left,"PRIORITY ACTIONS")
+    local _, st_AutoJoin, apply_AutoJoin = mkToggle(left, "AUTO JOIN", false)
+    local _, st_JoinRetry, box_JoinRetry = mkStackInput(left, "JOIN RETRY", "50", "50", true)
+
+    mkHeader(left,"MONEY FILTERS")
+    local _, st_MinMS, box_MinMS = mkStackInput(left, "MIN M/S", "100", "100", true)
+
+    mkHeader(left,"НАСТРОЙКИ")
+    local _, st_AutoInject, apply_AutoInject = mkToggle(left, "AUTO INJECT", false)
+    local _, st_IgnoreEn, apply_IgnoreEn     = mkToggle(left, "ENABLE IGNORE LIST", false)
+    local _, st_IgnoreNames, box_IgnoreNames = mkStackInput(left, "IGNORE NAMES", "name1,name2,...", "", false)
+
+    -- Right (пример списка)
+    mkHeader(right,"AVAILABLE LOBBIES").Size=UDim2.new(1,0,0,40)
+    local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; scroll.Size=UDim2.new(1,0,1,-50); scroll.Position=UDim2.new(0,0,0,46)
+    scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent=right
+    local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
+    local function addLobbyItem(nameText, moneyPerSec)
+        local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel
+        item.Parent=scroll; roundify(item,10); stroke(item, COLORS.purpleSoft, 1, 0.35); padding(item,12,6,12,6)
+        mkLabel(item, string.upper(nameText), 18, "bold", COLORS.textPrimary).Size=UDim2.new(0.5,-10,1,0)
+        local moneyLbl=mkLabel(item, string.upper(moneyPerSec), 17, "medium", Color3.fromRGB(130,255,130))
+        moneyLbl.AnchorPoint=Vector2.new(0.5,0.5); moneyLbl.Position=UDim2.new(0.62,0,0.5,0); moneyLbl.Size=UDim2.new(0.34,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Center
+        local joinBtn=Instance.new("TextButton"); joinBtn.Text="JOIN"; setFont(joinBtn,"bold"); joinBtn.TextSize=18; joinBtn.TextColor3=Color3.fromRGB(22,22,22)
+        joinBtn.AutoButtonColor=true; joinBtn.BackgroundColor3=COLORS.joinBtn; joinBtn.Size=UDim2.new(0,84,0,36); joinBtn.AnchorPoint=Vector2.new(1,0.5); joinBtn.Position=UDim2.new(1,-8,0.5,0)
+        roundify(joinBtn,10); stroke(joinBtn, Color3.fromRGB(0,0,0), 1, 0.7); joinBtn.Parent=item
+        joinBtn.MouseButton1Click:Connect(function() print("[JOIN] ->", nameText) end)
+        task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
+    end
+    for i=1,8 do addLobbyItem("BRAINROT NAME "..i, "MONEY/SECOND") end
+
+    -- =================================================================================
+    -- STATE + persistence
+    -- =================================================================================
+    local State = {
+        MinMS=100, AutoJoin=false, JoinRetry=50,
+        IgnoreEnabled=false, IgnoreNames={}, AutoInject=false
+    }
+    do
+        local cfg = cfg_load()
+        if cfg then
+            State = cfg
+        end
+    end
+
+    -- apply to UI (instant)
+    apply_AutoJoin(State.AutoJoin, true)
+    apply_AutoInject(State.AutoInject, true)
+    apply_IgnoreEn(State.IgnoreEnabled, true)
+    box_JoinRetry.Text  = tostring(State.JoinRetry)
+    box_MinMS.Text      = tostring(State.MinMS)
+    box_IgnoreNames.Text= table.concat(State.IgnoreNames, ",")
+
+    local function persist() cfg_save(State) end
+
+    -- on-change => save
+    st_AutoJoin.Changed   = function(v) State.AutoJoin=v; persist() end
+    st_AutoInject.Changed = function(v) State.AutoInject=v; persist() end
+    st_IgnoreEn.Changed   = function(v) State.IgnoreEnabled=v; persist() end
+    box_JoinRetry.FocusLost:Connect(function() State.JoinRetry=tonumber(box_JoinRetry.Text) or State.JoinRetry; persist() end)
+    box_MinMS.FocusLost:Connect(function() State.MinMS=tonumber(box_MinMS.Text) or State.MinMS; persist() end)
+    st_IgnoreNames.Changed= function(s)
+        State.IgnoreNames={}
+        for tok in (s or ""):gmatch("([^,%s]+)") do State.IgnoreNames[#State.IgnoreNames+1]=tok end
+        persist()
+    end
+
+    -- =================================================================================
+    -- AUTO INJECT (robust queue + keep-alive + teleport hook)
+    -- =================================================================================
+    local function pickQueue()
+        local q=nil
+        pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end)
+        if not q and type(queue_on_teleport)=="function" then q=queue_on_teleport end
+        if not q and type(queueteleport)=="function" then q=queueteleport end
+        if not q and type(fluxus)=="table" and type(fluxus.queue_on_teleport)=="function" then q=fluxus.queue_on_teleport end
+        return q
+    end
+
+    local function makeBootstrap(url)
+        url = tostring(url or "")
+        local s=""
+        s=s.."task.spawn(function()\n"
+        s=s.."  if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end\n"
+        s=s.."  local okP,Pl=pcall(function() return game:GetService('Players') end)\n"
+        s=s.."  if okP and Pl then local t0=os.clock(); while not Pl.LocalPlayer and os.clock()-t0<10 do task.wait(0.05) end end\n"
+        s=s.."  pcall(function() getgenv().__FLOPPA_UI_ACTIVE=nil end)\n"
+        s=s.."  local function safeget(u)\n"
+        s=s.."    for i=1,3 do local ok,res=pcall(function() return game:HttpGet(u) end); if ok and type(res)=='string' and #res>0 then return res end; task.wait(1) end\n"
+        s=s.."  end\n"
+        s=s.."  local src=safeget('"..AUTO_INJECT_URL.."')\n"
+        s=s.."  if src then local f=loadstring(src); if f then pcall(f) end end\n"
+        s=s.."end)\n"
+        return s
+    end
+
+    local lastQueued = 0
+    local function safeQueue(url, reason)
+        local q = pickQueue()
+        if not q or not url or url=="" then
+            err("queue_on_teleport недоступен или URL пуст")
+            return
+        end
+        lastQueued = os.clock()
+        q(makeBootstrap(url))
+        log("queued ("..(reason or "?")..")")
+    end
+
+    -- queue on startup + keep-alive refresher
+    task.defer(function()
+        if State.AutoInject then
+            safeQueue(AUTO_INJECT_URL, "startup")
+            task.spawn(function()
+                while gui and gui.Parent and State.AutoInject do
+                    if os.clock() - lastQueued > 15 then
+                        safeQueue(AUTO_INJECT_URL, "keepalive")
                     end
+                    task.wait(5)
                 end
+            end)
+        end
+    end)
+
+    -- queue again right before teleport
+    Players.LocalPlayer.OnTeleport:Connect(function(st)
+        if State.AutoInject and st==Enum.TeleportState.Started then
+            safeQueue(AUTO_INJECT_URL, "teleport")
+        end
+    end)
+
+    -- =================================================================================
+    -- Show/Hide (T) + Drag
+    -- =================================================================================
+    local function makeDraggable(frame, handle)
+        handle=handle or frame
+        local dragging=false; local startPos; local startMouse
+        handle.InputBegan:Connect(function(input)
+            if input.UserInputType==Enum.UserInputType.MouseButton1 then
+                dragging=true; startPos=frame.Position; startMouse=input.Position
+                input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end)
             end
-            return cfg
+        end)
+        UIS.InputChanged:Connect(function(input)
+            if dragging and input.UserInputType==Enum.UserInputType.MouseMovement then
+                local d=input.Position-startMouse
+                frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+            end
+        end)
+    end
+
+    local opened=true
+    local function setVisible(v, instant)
+        opened=v
+        if v then setBlur(true) else setBlur(false) end
+        local goal=v and UDim2.new(0.5,-490,0.5,-280) or UDim2.new(0.5,-490,1,30)
+        if instant then
+            main.Position=goal; main.Visible=v
+        else
+            if v then main.Visible=true end
+            local t=TweenService:Create(main, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Position=goal})
+            t:Play(); if not v then t.Completed:Wait(); main.Visible=false end
         end
     end
-    return nil, "not-found"
+    UIS.InputBegan:Connect(function(input,gp)
+        if not gp and input.KeyCode==FIXED_HOTKEY then setVisible(not opened,false) end
+    end)
+    makeDraggable(main, header)
+    task.defer(function() updateLeftCanvas(); setVisible(true,true) end)
+end)
+
+if not ok_main then
+    warn("[Floppa][FATAL]", topErr)
 end
-
----------------------------------------------------
--- ПРИМЕР ИСПОЛЬЗОВАНИЯ:
--- (раскомментируй и запусти один раз, чтобы проверить)
-
---[[
--- Сохранить:
-local ok, why = Config.Save({
-    MinMS = 100,
-    AutoJoin = true,
-    JoinRetry = 50,
-    IgnoreEnabled = false,
-    IgnoreNames = {"name1","name2","names3"},
-})
-print("Save:", ok, why or "")
-
--- Загрузить:
-local cfg, err = Config.Load()
-print("Load:", cfg and "ok" or "fail", err or "")
-if cfg then
-    print("MIN M/S =", cfg.MinMS)
-    print("A/J =", cfg.AutoJoin)
-    print("JOIN RETRY =", cfg.JoinRetry)
-    print("ENABLE IGNORE LIST =", cfg.IgnoreEnabled)
-    print("IGNORE NAMES ='"..table.concat(cfg.IgnoreNames,",").."'")
-end
-]]
----------------------------------------------------
-
-return Config
