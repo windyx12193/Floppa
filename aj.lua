@@ -1,11 +1,6 @@
 --[[
-  FLOPPA AUTO JOINER v5.4
-  • MIN M/S -> МИЛЛИОНЫ ($/s): 1 => $1,000,000/s
-  • Парсит HTML/<br>, CR/LF и NBSP; терпит "$22.5M/s", "$22M/s", "$780K/s"
-  • Дедуп по job_id (оставляет запись с max $/s)
-  • JOIN retry 10/сек, автоочистка записей старше 180с, подсветка свежих
-  • Хоткей: T; конфиг JSON: floppa_aj_settings.json
-  • AUTO INJECT: очередь на телепорт (без “run now”), переживает переходы
+  FLOPPA AUTO JOINER v5.6 (debug on)
+  Автор: специально под твои требования
 ]]
 
 ---------------- USER/API SETTINGS ----------------
@@ -20,17 +15,17 @@ local TARGET_PLACE_ID   = 109983668079237
 local PULL_INTERVAL_SEC = 2.0
 local ENTRY_TTL_SEC     = 180.0
 local FRESH_AGE_SEC     = 12.0
-local DEBUG_NETWORK     = false
+
+local DEBUG_NETWORK     = true   -- включён отладочный вывод
 ---------------------------------------------------
 
 -- Services / FS / JSON
-local Players, UIS, TweenService, Lighting, HttpService, TeleportService =
-      game:GetService("Players"),
-      game:GetService("UserInputService"),
-      game:GetService("TweenService"),
-      game:GetService("Lighting"),
-      game:GetService("HttpService"),
-      game:GetService("TeleportService")
+local Players          = game:GetService("Players")
+local UIS              = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Lighting         = game:GetService("Lighting")
+local HttpService      = game:GetService("HttpService")
+local TeleportService  = game:GetService("TeleportService")
 
 local function hasFS() return typeof(writefile)=="function" and typeof(readfile)=="function" and typeof(isfile)=="function" end
 local function saveJSON(path, t)
@@ -54,7 +49,7 @@ local function findGuiParent()
     if okH and hui then return hui end
     local okC, core = pcall(function() return game:GetService("CoreGui") end)
     if okC then return core end
-    return Players.LocalPlayer and Players.LocalPlayer:FindChildOfClass("PlayerGui") or nil
+    return Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui") or nil
 end
 do
     local par = findGuiParent()
@@ -195,6 +190,22 @@ mkLabel(header,"FLOPPA AUTO JOINER",20,"bold",COLORS.textPrimary).Size=UDim2.new
 local hotkeyInfo=mkLabel(header,"OPEN GUI KEY:  T",16,"medium",COLORS.textWeak)
 hotkeyInfo.AnchorPoint=Vector2.new(1,0.5); hotkeyInfo.Position=UDim2.new(1,-14,0.5,0); hotkeyInfo.Size=UDim2.new(0.35,0,1,0); hotkeyInfo.TextXAlignment=Enum.TextXAlignment.Right
 
+-- Ручной refresh (на всякий)
+local refreshBtn = Instance.new("TextButton")
+refreshBtn.Text = "Refresh"
+setFont(refreshBtn, "medium")
+refreshBtn.TextSize = 14
+refreshBtn.TextColor3 = COLORS.textPrimary
+refreshBtn.BackgroundColor3 = COLORS.surface
+refreshBtn.BackgroundTransparency = 0.1
+refreshBtn.Size = UDim2.new(0, 80, 0, 28)
+refreshBtn.AnchorPoint = Vector2.new(1, 0.5)
+refreshBtn.Position = UDim2.new(1, -180, 0.5, 0)
+refreshBtn.AutoButtonColor = true
+roundify(refreshBtn, 8)
+stroke(refreshBtn, COLORS.purpleSoft, 1, 0.4)
+refreshBtn.Parent = header
+
 -- Columns
 local left=Instance.new("ScrollingFrame"); left.Size=UDim2.new(0,300,1,-58); left.Position=UDim2.new(0,0,0,58); left.BackgroundTransparency=1
 left.ScrollBarThickness=6; left.ScrollingDirection=Enum.ScrollingDirection.Y; left.CanvasSize=UDim2.new(0,0,0,0); left.Parent=main
@@ -207,15 +218,12 @@ local right=Instance.new("Frame"); right.Size=UDim2.new(1,-320,1,-58); right.Pos
 right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card; right.Parent=main
 roundify(right,12); stroke(right); padding(right,12,12,12,12)
 
--- Empty-state badge
-local function mkBadge(parent)
-    local t = mkLabel(parent, "", 14, "medium", Color3.fromRGB(255,150,150))
-    t.Size = UDim2.new(1, -10, 0, 18)
-    t.Position = UDim2.new(0, 6, 0, 6)
-    t.Visible = false
-    return t
-end
-local emptyBadge = mkBadge(right)
+-- Stats label
+local statsLbl = mkLabel(right, "", 13, "medium", COLORS.textWeak)
+statsLbl.AnchorPoint = Vector2.new(1, 0)
+statsLbl.Position    = UDim2.new(1, -10, 0, 8)
+statsLbl.Size        = UDim2.new(0, 260, 0, 16)
+statsLbl.TextXAlignment = Enum.TextXAlignment.Right
 
 -- Left blocks
 mkHeader(left,"PRIORITY ACTIONS")
@@ -237,10 +245,8 @@ scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent
 local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
 
 -- Persist settings
-local LOADING=false
 local function parseIgnore(s) local r={} for tok in (s or ""):gmatch("([^,%s]+)") do r[#r+1]=tok end return r end
 local function saveSettings()
-    if LOADING then return end
     saveJSON(SETTINGS_PATH, {
         AutoJoin      = autoJoin.Value,
         AutoInject    = autoInject.Value,
@@ -266,8 +272,7 @@ local function pickQueue()
     if not q and type(fluxus)=="table" and type(fluxus.queue_on_teleport)=="function" then q=fluxus.queue_on_teleport end
     return q
 end
-local function makeBootstrap(url)
-    url=tostring(url or "")
+local function makeBootstrap()
     local s=""
     s=s.."task.spawn(function()\n"
     s=s.."  if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end\n"
@@ -280,9 +285,9 @@ local function makeBootstrap(url)
     s=s.."end)\n"
     return s
 end
-local function queueReinject(url) local q=pickQueue(); if q and url~="" then q(makeBootstrap(url)) end end
-if State.AutoInject then queueReinject(AUTO_INJECT_URL) end
-Players.LocalPlayer.OnTeleport:Connect(function(st) if autoInject.Value and st==Enum.TeleportState.Started then queueReinject(AUTO_INJECT_URL) end end)
+local function queueReinject() local q=pickQueue(); if q then q(makeBootstrap()) end end
+if State.AutoInject then queueReinject() end
+Players.LocalPlayer.OnTeleport:Connect(function(st) if autoInject.Value and st==Enum.TeleportState.Started then queueReinject() end end)
 
 -- Money parser (robust)
 local multipliers = {K=1e3, M=1e6, B=1e9, T=1e12}
@@ -290,8 +295,8 @@ local function parseMoney(text)
     local s = tostring(text or "")
     s = s:gsub("\194\160"," ")  -- NBSP -> space
          :gsub(",", "")         -- 11,200,000 -> 11200000
-         :gsub("%s+", "")       -- remove all spaces
-         :upper()               -- K/M/B/T and S
+         :gsub("%s+", "")       -- remove spaces
+         :upper()               -- K/M/B/T и S
     local num, unit = s:match("%$(%d+%.?%d*)([KMBT]?)/S")
     if not num then num, unit = s:match("%$(%d+%.?%d*)([KMBT]?)") end
     if not num then return 0 end
@@ -412,19 +417,15 @@ local function refreshListVisual()
             visibleCount += 1
         end
     end
-    emptyBadge.Visible = (visibleCount == 0)
-    if emptyBadge.Visible then
-        local minM = tonumber(msBox.Text) or State.MinMS or 0
-        local ig  = (ignoreToggle.Value and #State.IgnoreNames>0) and ("; ignore: "..table.concat(State.IgnoreNames, ",")) or ""
-        emptyBadge.Text = ("No lobbies pass filters (min= %dM/s%s)"):format(minM, ig)
-    end
+    local minM = tonumber(msBox.Text) or State.MinMS or 0
+    statsLbl.Text = string.format("fetched: %s • shown: %d • min: %dM/s", "—", visibleCount, minM)
     task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
 end
 
 -- Robust trim (incl. NBSP)
 local function trimSpaces(s)
     s = tostring(s or "")
-    s = s:gsub("\226\128\139", "") -- zero-width no-break space (на всякий случай)
+    s = s:gsub("\226\128\139", "") -- zero-width
          :gsub("\194\160", " ")    -- NBSP
     s = s:gsub("^%s+",""):gsub("%s+$","")
     return s
@@ -433,12 +434,12 @@ end
 -- parse one line
 local function parseLine(line)
     line = tostring(line or "")
-    line = line:gsub("%*%*", ""):gsub("\t"," "):gsub("\194\160"," ")
+    line = line:gsub("%*%*",""):gsub("\t"," "):gsub("\194\160"," ")
     local parts = {}
     for token in line:gmatch("([^|]+)") do
         parts[#parts+1] = trimSpaces(token)
     end
-    if #parts < 4 then return nil end -- timestamp можно отсутствовать
+    if #parts < 4 then return nil end
     local name, moneyStr, playersStr, jobId = parts[1], parts[2], parts[3], parts[4]
     local pNow, pMax = playersStr:match("(%d+)%s*/%s*(%d+)")
     pNow = tonumber(pNow or "0") or 0
@@ -447,18 +448,21 @@ local function parseLine(line)
     return { name=name, moneyStr=moneyStr, mps=mps, players=pNow, max=pMax, jobId=jobId, ts=parts[5] }
 end
 
+-- counters for UI
+local last_total_lines, last_kept = 0, 0
+
 -- parse entire body
 local function parseAll(raw)
     local body = tostring(raw or "")
-    body = body:gsub("^\239\187\191","")   -- BOM
+    body = body:gsub("^\239\187\191","")
                :gsub("\r\n","\n")
                :gsub("\r","\n")
                :gsub("<[Bb][Rr]%s*/?>","\n")
                :gsub("</?%w+[^>]*>","")
                :gsub("&nbsp;"," ")
-               :gsub("\194\160"," ")       -- NBSP
+               :gsub("\194\160"," ")
     local now  = os.clock()
-    local best = {}  -- jobId -> best record
+    local best = {}
 
     for line in body:gmatch("[^\n]+") do
         if line:match("%S") then
@@ -471,41 +475,63 @@ local function parseAll(raw)
     end
 
     for jobId, d in pairs(best) do updateEntry(jobId, d) end
-    for jobId, e in pairs(Entries) do if (now - e.lastSeen) > ENTRY_TTL_SEC then removeEntry(jobId) end end
+    for jobId, e in pairs(Entries) do
+        if (now - e.lastSeen) > ENTRY_TTL_SEC then removeEntry(jobId) end
+    end
     refreshListVisual()
 
+    last_kept = 0
+    for _ in pairs(best) do last_kept += 1 end
+
     if DEBUG_NETWORK then
-        local countBest=0 for _ in pairs(best) do countBest+=1 end
-        print(("[Floppa] kept=%d entries=%d"):format(countBest, (function() local c=0 for _ in pairs(Entries) do c+=1 end return c end)()))
+        local totalNow=0 for _ in pairs(Entries) do totalNow+=1 end
+        print(string.format("[Floppa] parseAll: totalEntries=%d keptNow=%d", totalNow, last_kept))
     end
 end
 
--- pull with fallback
-local function buildURL(withKey)
-    if withKey == false then return SERVER_URL end
-    local sep = SERVER_URL:find("?") and "&" or "?"
-    return SERVER_URL .. sep .. "key=" .. tostring(API_KEY)
+-- cache-buster URL
+local function buildURL(useKey)
+    local base = SERVER_URL
+    local sep  = base:find("%?") and "&" or "?"
+    local url  = string.format("%s% s_cb=%d%d", base, sep, os.time(), math.random(1000,9999))
+    if useKey ~= false then
+        url = url .. "&key=" .. tostring(API_KEY)
+    end
+    return url
 end
+
+-- pull once, with fallback
 local function pullOnce()
     local ok, body = pcall(function() return game:HttpGet(buildURL(true)) end)
-    if not ok or type(body)~="string" or #body==0 then
+    if (not ok) or (type(body) ~= "string") or (#body == 0) then
         if DEBUG_NETWORK then warn("[Floppa] key-request failed, trying without key…") end
         ok, body = pcall(function() return game:HttpGet(buildURL(false)) end)
     end
     if ok and type(body)=="string" and #body>0 then
-        if DEBUG_NETWORK then print("[Floppa] got bytes:", #body) end
+        local cnt=0 for _ in body:gmatch("[^\r\n]+") do cnt+=1 end
+        last_total_lines = cnt
+        if DEBUG_NETWORK then print("[Floppa] fetched bytes:", #body, "lines:", cnt) end
         parseAll(body)
-    elseif DEBUG_NETWORK then
-        warn("[Floppa] empty/failed response")
+        statsLbl.Text = string.format("fetched: %d • shown: %d • min: %dM/s", last_total_lines, last_kept, tonumber(msBox.Text) or State.MinMS or 0)
+    else
+        for id in pairs(Entries) do removeEntry(id) end
+        statsLbl.Text = "Network error: no data"
+        if DEBUG_NETWORK then warn("[Floppa] pullOnce failed") end
     end
 end
 
 -- Poll loop
 task.spawn(function()
     while gui and gui.Parent do
-        pullOnce()
+        local ok = pcall(pullOnce)
+        if not ok and DEBUG_NETWORK then warn("[Floppa] pullOnce pcall crashed") end
         task.wait(PULL_INTERVAL_SEC)
     end
+end)
+
+refreshBtn.MouseButton1Click:Connect(function()
+    if DEBUG_NETWORK then print("[Floppa] manual refresh") end
+    pcall(pullOnce)
 end)
 
 -- Show/Hide + drag
