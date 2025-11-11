@@ -1,9 +1,10 @@
 --[[
-  FLOPPA AUTO JOINER v5.2 (networked + dedupe, MIN M/S in MILLIONS)
-  • MIN M/S интерпретируется как миллионы $/s: 1 => $1,000,000/s
-  • Тянет лобби с бэкенда, парсит HTML/текст, дедуп по jobId (max $/s)
-  • JOIN с ретраями (10/сек), автоочистка старых > 180с, визуальная свежесть
-  • Хоткей: T, JSON-конфиг сохраняется в floppa_aj_settings.json
+  FLOPPA AUTO JOINER v5.3
+  • MIN M/S -> МИЛЛИОНЫ ($/s): 1 => $1,000,000/s
+  • Парсит HTML/<br>, CR/LF и Юникод NBSP (U+00A0)
+  • Дедуп по job_id (берём запись с max $/s)
+  • JOIN retry 10/сек, автоочистка >180с, подсветка свежих
+  • Хоткей: T, конфиг JSON: floppa_aj_settings.json
 ]]
 
 ---------------- USER/API SETTINGS ----------------
@@ -11,23 +12,17 @@ local AUTO_INJECT_URL   = "https://raw.githubusercontent.com/windyx12193/Floppa/
 local FIXED_HOTKEY      = Enum.KeyCode.T
 local SETTINGS_PATH     = "floppa_aj_settings.json"
 
--- API источник
-local SERVER_URL = "https://server-eta-two-29.vercel.app/"
-local API_KEY    = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
+local SERVER_URL        = "https://server-eta-two-29.vercel.app/"
+local API_KEY           = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
 
--- игру куда телепортируем
 local TARGET_PLACE_ID   = 109983668079237
-
--- частота опроса и устаревание
 local PULL_INTERVAL_SEC = 2.0
-local ENTRY_TTL_SEC     = 180.0   -- 3 минуты
+local ENTRY_TTL_SEC     = 180.0
 local FRESH_AGE_SEC     = 12.0
-
--- отладка сети (false по умолчанию)
 local DEBUG_NETWORK     = false
 ---------------------------------------------------
 
--- ====== Services / FS / JSON ======
+-- Services / FS / JSON
 local Players, UIS, TweenService, Lighting, HttpService, TeleportService =
       game:GetService("Players"),
       game:GetService("UserInputService"),
@@ -36,9 +31,7 @@ local Players, UIS, TweenService, Lighting, HttpService, TeleportService =
       game:GetService("HttpService"),
       game:GetService("TeleportService")
 
-local function hasFS()
-    return typeof(writefile)=="function" and typeof(readfile)=="function" and typeof(isfile)=="function"
-end
+local function hasFS() return typeof(writefile)=="function" and typeof(readfile)=="function" and typeof(isfile)=="function" end
 local function saveJSON(path, t)
     if not hasFS() then return false end
     local ok, data = pcall(function() return HttpService:JSONEncode(t) end)
@@ -54,7 +47,7 @@ local function loadJSON(path)
     return tbl
 end
 
--- ====== Singleton cleanup ======
+-- Singleton cleanup
 local function findGuiParent()
     local okH, hui = pcall(function() return gethui and gethui() end)
     if okH and hui then return hui end
@@ -72,13 +65,13 @@ do
     G.__FLOPPA_UI_ACTIVE = true
 end
 
--- ====== State (загружаем ДО UI) ======
+-- State (load before UI)
 local State = {
     AutoJoin      = false,
     AutoInject    = false,
     IgnoreEnabled = false,
     JoinRetry     = 50,
-    MinMS         = 1,     -- теперь в МИЛЛИОНАХ ($/s): 1 => $1M/s
+    MinMS         = 1,       -- МИЛЛИОНЫ
     IgnoreNames   = {}
 }
 do
@@ -93,7 +86,7 @@ do
     end
 end
 
--- ====== Style / helpers ======
+-- Style & helpers
 local COLORS = {
     purpleDeep  = Color3.fromRGB(96, 63, 196),
     purple      = Color3.fromRGB(134, 102, 255),
@@ -179,7 +172,7 @@ local function mkStackInput(parent, title, placeholder, defaultText, isNumeric)
     return row, state, box
 end
 
--- ====== Blur ======
+-- Blur
 local blur=Lighting:FindFirstChild("FloppaLightBlur") or Instance.new("BlurEffect")
 blur.Name="FloppaLightBlur"; blur.Size=0; blur.Enabled=false; blur.Parent=Lighting
 local function setBlur(e)
@@ -187,7 +180,7 @@ local function setBlur(e)
     else TweenService:Create(blur, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Size=0}):Play(); task.delay(0.16,function() blur.Enabled=false end) end
 end
 
--- ====== Root GUI ======
+-- Root GUI
 local parent = findGuiParent() or Players.LocalPlayer:WaitForChild("PlayerGui")
 local gui=Instance.new("ScreenGui"); gui.Name="FloppaAutoJoinerGui"; gui.IgnoreGuiInset=true; gui.ResetOnSpawn=false; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; gui.DisplayOrder=1e6; gui.Parent=parent
 local main=Instance.new("Frame"); main.Name="Main"; main.Size=UDim2.new(0,980,0,560); main.Position=UDim2.new(0.5,-490,0.5,-280)
@@ -213,6 +206,12 @@ local right=Instance.new("Frame"); right.Size=UDim2.new(1,-320,1,-58); right.Pos
 right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card; right.Parent=main
 roundify(right,12); stroke(right); padding(right,12,12,12,12)
 
+-- Empty-state badge
+local emptyBadge = mkLabel(right, "", 14, "medium", Color3.fromRGB(255,150,150))
+emptyBadge.Size = UDim2.new(1, -10, 0, 18)
+emptyBadge.Position = UDim2.new(0, 6, 0, 6)
+emptyBadge.Visible = false
+
 -- Left blocks
 mkHeader(left,"PRIORITY ACTIONS")
 local _, autoJoin,     applyAutoJoin   = mkToggle(left, "AUTO JOIN", State.AutoJoin)
@@ -232,7 +231,7 @@ local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; sc
 scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent=right
 local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
 
--- ====== Persist settings ======
+-- Persist settings
 local LOADING=false
 local function parseIgnore(s) local r={} for tok in (s or ""):gmatch("([^,%s]+)") do r[#r+1]=tok end return r end
 local function saveSettings()
@@ -253,7 +252,7 @@ jrBox.FocusLost:Connect(function() State.JoinRetry=tonumber(jrBox.Text) or State
 msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; saveSettings() end)
 ignoreState.Changed  = function(txt) State.IgnoreNames=parseIgnore(txt); saveSettings() end
 
--- ====== AutoInject (очередь) ======
+-- AutoInject queue
 local function pickQueue()
     local q=nil
     pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end)
@@ -276,21 +275,14 @@ local function makeBootstrap(url)
     s=s.."end)\n"
     return s
 end
-local function queueReinject(url)
-    local q = pickQueue()
-    if q and url~="" then q(makeBootstrap(url)) end
-end
+local function queueReinject(url) local q=pickQueue(); if q and url~="" then q(makeBootstrap(url)) end end
 if State.AutoInject then queueReinject(AUTO_INJECT_URL) end
-Players.LocalPlayer.OnTeleport:Connect(function(st)
-    if autoInject.Value and st==Enum.TeleportState.Started then
-        queueReinject(AUTO_INJECT_URL)
-    end
-end)
+Players.LocalPlayer.OnTeleport:Connect(function(st) if autoInject.Value and st==Enum.TeleportState.Started then queueReinject(AUTO_INJECT_URL) end end)
 
--- ====== Network parsing / rendering ======
+-- Network parsing / rendering
 local multipliers = {K=1e3, M=1e6, B=1e9, T=1e12}
 local function parseMoney(text)
-    text = tostring(text or ""):upper()
+    text = tostring(text or ""):upper():gsub(",", "")
     local num, unit = text:match("%$%s*([%d%.]+)%s*([KMBT]?)%s*/%s*S")
     if not num then return 0 end
     local n = tonumber(num) or 0
@@ -298,7 +290,7 @@ local function parseMoney(text)
     return math.floor(n * mul + 0.5)
 end
 
--- теперь MIN M/S = миллионы $/s
+-- MIN M/S в миллионах
 local function minThreshold()
     local v = tonumber(msBox.Text) or State.MinMS or 0
     return v * 1e6
@@ -314,21 +306,16 @@ local function visibleByFilters(d)
     if d.mps < minThreshold() then return false end
     if State.IgnoreEnabled then
         for _,nm in ipairs(State.IgnoreNames) do
-            if #nm>0 and d.name:lower():find(nm:lower(),1,true) then
-                return false
-            end
+            if #nm>0 and d.name:lower():find(nm:lower(),1,true) then return false end
         end
     end
     return true
 end
 
-local function formatPlayers(p,m)
-    return string.format("%d/%d", p or 0, m or 0)
-end
+local function formatPlayers(p,m) return string.format("%d/%d", p or 0, m or 0) end
 
 -- UI storage
-local Entries = {}   -- jobId -> {data, frame, firstSeen, lastSeen}
-local Order   = {}   -- порядок отображения
+local Entries, Order = {}, {}
 
 local function ensureEntryFrame(jobId, data)
     local e = Entries[jobId]
@@ -360,13 +347,8 @@ local function ensureEntryFrame(jobId, data)
             local ok = pcall(function()
                 TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, Players.LocalPlayer)
             end)
-            if ok then
-                joinBtn.Text = "OK"
-                break
-            else
-                joinBtn.Text = ("RETRY %d/%d"):format(i, tries)
-                task.wait(delaySec)
-            end
+            if ok then joinBtn.Text = "OK"; break
+            else joinBtn.Text = ("RETRY %d/%d"):format(i, tries); task.wait(delaySec) end
         end
         task.delay(0.8, function() if joinBtn then joinBtn.Text="JOIN" end end)
     end)
@@ -382,10 +364,7 @@ local function updateEntry(jobId, data)
         table.insert(Order, jobId)
         e = Entries[jobId]
     else
-        -- дедуп: оставляем самую прибыльную запись для этого jobId
-        if data.mps > (e.data.mps or 0) then
-            e.data = data
-        end
+        if data.mps > (e.data.mps or 0) then e.data = data end
         e.lastSeen = os.clock()
     end
     local item = e.frame
@@ -398,8 +377,7 @@ local function updateEntry(jobId, data)
 end
 
 local function removeEntry(jobId)
-    local e = Entries[jobId]
-    if not e then return end
+    local e = Entries[jobId]; if not e then return end
     if e.frame then pcall(function() e.frame:Destroy() end) end
     Entries[jobId] = nil
     for i=#Order,1,-1 do if Order[i]==jobId then table.remove(Order,i) break end end
@@ -412,6 +390,7 @@ local function refreshListVisual()
         if ea.data.mps ~= eb.data.mps then return ea.data.mps > eb.data.mps end
         return ea.lastSeen > eb.lastSeen
     end)
+    local visibleCount = 0
     for idx, jobId in ipairs(Order) do
         local e = Entries[jobId]
         if e and e.frame and e.frame.Parent == scroll then
@@ -425,42 +404,54 @@ local function refreshListVisual()
                 local staleness = math.clamp((os.clock()-e.lastSeen)/ENTRY_TTL_SEC, 0, 1)
                 e.frame.BackgroundTransparency = ALPHA.panel + 0.05*staleness
             end
+            visibleCount += 1
         end
+    end
+    emptyBadge.Visible = (visibleCount == 0)
+    if emptyBadge.Visible then
+        local minM = tonumber(msBox.Text) or State.MinMS or 0
+        local ig  = (State.IgnoreEnabled and #State.IgnoreNames>0) and ("; ignore: "..table.concat(State.IgnoreNames, ",")) or ""
+        emptyBadge.Text = ("No lobbies pass filters (min= %dM/s%s)"):format(minM, ig)
     end
     task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
 end
 
--- парсер строки
+-- Robust trim (включая NBSP)
+local function trimSpaces(s)
+    s = s:gsub("\226\128\139", "")      -- ZERO WIDTH NO-BREAK SPACE (на всякий)
+    s = s:gsub("\194\160", " ")         -- NBSP
+    s = s:gsub("^%s+",""):gsub("%s+$","")
+    return s
+end
+
+-- parse one line
 local function parseLine(line)
     line = tostring(line or "")
     line = line:gsub("%*%*", ""):gsub("\t"," ")
+    line = line:gsub("\194\160"," ")   -- NBSP -> space
     local parts = {}
     for token in line:gmatch("([^|]+)") do
-        parts[#parts+1] = (token:gsub("^%s+",""):gsub("%s+$",""))
+        parts[#parts+1] = trimSpaces(token)
     end
-    if #parts < 5 then return nil end
-    local name, moneyStr, playersStr, jobId, ts =
-          parts[1], parts[2], parts[3], parts[4], parts[5]
+    if #parts < 4 then return nil end  -- ts может отсутствовать
+    local name, moneyStr, playersStr, jobId = parts[1], parts[2], parts[3], parts[4]
     local pNow, pMax = playersStr:match("(%d+)%s*/%s*(%d+)")
     pNow = tonumber(pNow or "0") or 0
     pMax = tonumber(pMax or "0") or 0
     local mps = parseMoney(moneyStr)
-    return {
-        name = name, moneyStr = moneyStr, mps = mps,
-        players = pNow, max = pMax, jobId = jobId, ts = ts
-    }
+    return { name=name, moneyStr=moneyStr, mps=mps, players=pNow, max=pMax, jobId=jobId, ts=parts[5] }
 end
 
--- парс всего ответа: чистим HTML, BOM, режем строки; применяем дедуп
+-- parse entire body
 local function parseAll(raw)
     local body = tostring(raw or "")
-    body = body:gsub("^\239\187\191","") -- BOM
+    body = body:gsub("^\239\187\191","")   -- BOM
                :gsub("\r\n","\n")
                :gsub("\r","\n")
                :gsub("<[Bb][Rr]%s*/?>","\n")
                :gsub("</?%w+[^>]*>","")
                :gsub("&nbsp;"," ")
-
+               :gsub("\194\160"," ")       -- NBSP (UTF-8)
     local now  = os.clock()
     local best = {}  -- jobId -> best record
 
@@ -469,40 +460,27 @@ local function parseAll(raw)
             local d = parseLine(line)
             if d and visibleByFilters(d) then
                 local cur = best[d.jobId]
-                if not cur or d.mps > cur.mps then
-                    best[d.jobId] = d
-                end
+                if not cur or d.mps > cur.mps then best[d.jobId] = d end
             end
         end
     end
 
-    for jobId, d in pairs(best) do
-        updateEntry(jobId, d)
-    end
-
-    for jobId, e in pairs(Entries) do
-        if (now - e.lastSeen) > ENTRY_TTL_SEC then
-            removeEntry(jobId)
-        end
-    end
-
+    for jobId, d in pairs(best) do updateEntry(jobId, d) end
+    for jobId, e in pairs(Entries) do if (now - e.lastSeen) > ENTRY_TTL_SEC then removeEntry(jobId) end end
     refreshListVisual()
+
     if DEBUG_NETWORK then
-        print(("[Floppa] kept=%d, entries=%d"):format((function() local c=0 for _ in pairs(best) do c+=1 end return c end)(), (function() local c=0 for _ in pairs(Entries) do c+=1 end return c end)()))
+        local countBest=0 for _ in pairs(best) do countBest+=1 end
+        print(("[Floppa] kept=%d entries=%d"):format(countBest, (function() local c=0 for _ in pairs(Entries) do c+=1 end return c end)()))
     end
 end
 
--- запрос с fallback (с ключом/без ключа)
-local function buildURL(withKey)
-    if withKey == false then return SERVER_URL end
-    local sep = SERVER_URL:find("?") and "&" or "?"
-    return SERVER_URL .. sep .. "key=" .. tostring(API_KEY)
-end
+-- pull with fallback
 local function pullOnce()
-    local ok, body = pcall(function() return game:HttpGet(buildURL(true)) end)
+    local ok, body = pcall(function() return game:HttpGet((SERVER_URL:find("?") and SERVER_URL.."&key=" or SERVER_URL.."?" ).."key="..tostring(API_KEY)) end)
     if not ok or type(body)~="string" or #body==0 then
         if DEBUG_NETWORK then warn("[Floppa] key-request failed, trying without key…") end
-        ok, body = pcall(function() return game:HttpGet(buildURL(false)) end)
+        ok, body = pcall(function() return game:HttpGet(SERVER_URL) end)
     end
     if ok and type(body)=="string" and #body>0 then
         if DEBUG_NETWORK then print("[Floppa] got bytes:", #body) end
@@ -512,7 +490,7 @@ local function pullOnce()
     end
 end
 
--- ====== Poll loop ======
+-- Poll loop
 task.spawn(function()
     while gui and gui.Parent do
         pullOnce()
@@ -520,7 +498,7 @@ task.spawn(function()
     end
 end)
 
--- ====== Show/Hide + drag ======
+-- Show/Hide + drag
 local function makeDraggable(frame, handle)
     handle=handle or frame
     local dragging=false; local startPos; local startMouse
@@ -549,9 +527,7 @@ local function setVisible(v,instant)
         t:Play(); if not v then t.Completed:Wait(); main.Visible=false end
     end
 end
-UIS.InputBegan:Connect(function(input, gp)
-    if not gp and input.KeyCode==FIXED_HOTKEY then setVisible(not opened,false) end
-end)
+UIS.InputBegan:Connect(function(input, gp) if not gp and input.KeyCode==FIXED_HOTKEY then setVisible(not opened,false) end end)
 makeDraggable(main, header)
 
 task.defer(function() updateLeftCanvas(); setVisible(true,true) end)
