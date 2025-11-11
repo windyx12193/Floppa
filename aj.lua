@@ -9,7 +9,7 @@
 ------------------ USER SETTINGS ------------------
 -- Поставь сюда raw-URL скрипта, который должен авто-запускаться на новом сервере.
 -- РЕКОМЕНДОВАНО указать ДРУГОЙ файл, не этот aj.lua.
-local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/aj.lua"  -- например: "https://raw.githubusercontent.com/user/repo/main/main.lua"
+local AUTO_INJECT_URL = ""  -- например: "https://raw.githubusercontent.com/user/repo/main/main.lua"
 local DEFAULT_HOTKEY  = Enum.KeyCode.K
 ---------------------------------------------------
 
