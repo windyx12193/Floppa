@@ -13,13 +13,24 @@ local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/re
 local DEFAULT_HOTKEY  = Enum.KeyCode.K
 ---------------------------------------------------
 
--- === Singleton guard ===
+-- === Restart-friendly singleton ===
 local G = (getgenv and getgenv()) or _G
-if G.__FLOPPA_UI_ACTIVE then
-    warn("[Floppa] UI уже запущен — второй экземпляр блокирован.")
-    return
+local function findGuiParent()
+    local okH, hui = pcall(function() return gethui and gethui() end)
+    if okH and hui then return hui end
+    local okC, core = pcall(function() return game:GetService("CoreGui") end)
+    if okC then return core end
+    return game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
 end
+
+-- если старый GUI есть — удалим и разрешим перезапуск
+local parent = findGuiParent()
+local old = parent:FindFirstChild("FloppaAutoJoinerGui")
+if old then pcall(function() old:Destroy() end) end
+
+-- флаг только информативный, не блокирующий
 G.__FLOPPA_UI_ACTIVE = true
+
 
 -- === Services ===
 local Players      = game:GetService("Players")
