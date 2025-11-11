@@ -1,9 +1,9 @@
 --[[
-  FLOPPA AUTO JOINER v5.1 (networked + dedupe by job_id)
-  • Тянет лобби с твоего бэкенда, парсит HTML/текст, рендерит список
-  • Дедупликация по JOB_ID -> оставляем запись с максимальным $/s
+  FLOPPA AUTO JOINER v5.2 (networked + dedupe, MIN M/S in MILLIONS)
+  • MIN M/S интерпретируется как миллионы $/s: 1 => $1,000,000/s
+  • Тянет лобби с бэкенда, парсит HTML/текст, дедуп по jobId (max $/s)
   • JOIN с ретраями (10/сек), автоочистка старых > 180с, визуальная свежесть
-  • Хоткей: T, JSON-конфиг как в v4.7
+  • Хоткей: T, JSON-конфиг сохраняется в floppa_aj_settings.json
 ]]
 
 ---------------- USER/API SETTINGS ----------------
@@ -22,6 +22,9 @@ local TARGET_PLACE_ID   = 109983668079237
 local PULL_INTERVAL_SEC = 2.0
 local ENTRY_TTL_SEC     = 180.0   -- 3 минуты
 local FRESH_AGE_SEC     = 12.0
+
+-- отладка сети (false по умолчанию)
+local DEBUG_NETWORK     = false
 ---------------------------------------------------
 
 -- ====== Services / FS / JSON ======
@@ -75,7 +78,7 @@ local State = {
     AutoInject    = false,
     IgnoreEnabled = false,
     JoinRetry     = 50,
-    MinMS         = 100,  -- трактуем как «100K/s» (см. фильтр)
+    MinMS         = 1,     -- теперь в МИЛЛИОНАХ ($/s): 1 => $1M/s
     IgnoreNames   = {}
 }
 do
@@ -216,7 +219,7 @@ local _, autoJoin,     applyAutoJoin   = mkToggle(left, "AUTO JOIN", State.AutoJ
 local _, _,            jrBox           = mkStackInput(left, "JOIN RETRY", "50", tostring(State.JoinRetry), true)
 
 mkHeader(left,"MONEY FILTERS")
-local _, _,            msBox           = mkStackInput(left, "MIN M/S", "100", tostring(State.MinMS), true)
+local _, _,            msBox           = mkStackInput(left, "MIN M/S", "1 (= $1M/s)", tostring(State.MinMS), true)
 
 mkHeader(left,"НАСТРОЙКИ")
 local _, autoInject,   applyAutoInject = mkToggle(left, "AUTO INJECT", State.AutoInject)
@@ -277,7 +280,7 @@ local function queueReinject(url)
     local q = pickQueue()
     if q and url~="" then q(makeBootstrap(url)) end
 end
-if autoInject.Value then queueReinject(AUTO_INJECT_URL) end
+if State.AutoInject then queueReinject(AUTO_INJECT_URL) end
 Players.LocalPlayer.OnTeleport:Connect(function(st)
     if autoInject.Value and st==Enum.TeleportState.Started then
         queueReinject(AUTO_INJECT_URL)
@@ -295,16 +298,16 @@ local function parseMoney(text)
     return math.floor(n * mul + 0.5)
 end
 
+-- теперь MIN M/S = миллионы $/s
+local function minThreshold()
+    local v = tonumber(msBox.Text) or State.MinMS or 0
+    return v * 1e6
+end
+
 local function buildURL(withKey)
     if withKey == false then return SERVER_URL end
     local sep = SERVER_URL:find("?") and "&" or "?"
     return SERVER_URL .. sep .. "key=" .. tostring(API_KEY)
-end
-
--- MIN M/S трактуем как «в тысячах»: 100 => 100K/s
-local function minThreshold()
-    local v = tonumber(msBox.Text) or State.MinMS or 0
-    return v * 1e3
 end
 
 local function visibleByFilters(d)
@@ -379,13 +382,12 @@ local function updateEntry(jobId, data)
         table.insert(Order, jobId)
         e = Entries[jobId]
     else
-        -- если пришла ещё одна запись с тем же jobId, оставляем самую прибыльную
+        -- дедуп: оставляем самую прибыльную запись для этого jobId
         if data.mps > (e.data.mps or 0) then
             e.data = data
         end
         e.lastSeen = os.clock()
     end
-    -- обновить тексты
     local item = e.frame
     if item and item.Parent then
         local kids = item:GetChildren()
@@ -428,7 +430,7 @@ local function refreshListVisual()
     task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
 end
 
--- парсер одной строки
+-- парсер строки
 local function parseLine(line)
     line = tostring(line or "")
     line = line:gsub("%*%*", ""):gsub("\t"," ")
@@ -449,18 +451,20 @@ local function parseLine(line)
     }
 end
 
--- парс всего ответа: чистим HTML и режем по строкам; дедуп по jobId с max mps
+-- парс всего ответа: чистим HTML, BOM, режем строки; применяем дедуп
 local function parseAll(raw)
     local body = tostring(raw or "")
-    body = body:gsub("\r\n","\n")
+    body = body:gsub("^\239\187\191","") -- BOM
+               :gsub("\r\n","\n")
+               :gsub("\r","\n")
                :gsub("<[Bb][Rr]%s*/?>","\n")
                :gsub("</?%w+[^>]*>","")
                :gsub("&nbsp;"," ")
-    local now = os.clock()
 
-    -- временный буфер best[jobId] = bestData
-    local best = {}
-    for line in (body.."\n"):gmatch("(.-)\n") do
+    local now  = os.clock()
+    local best = {}  -- jobId -> best record
+
+    for line in body:gmatch("[^\n]+") do
         if line:match("%S") then
             local d = parseLine(line)
             if d and visibleByFilters(d) then
@@ -472,12 +476,10 @@ local function parseAll(raw)
         end
     end
 
-    -- применяем буфер в Entries
     for jobId, d in pairs(best) do
         updateEntry(jobId, d)
     end
 
-    -- чистим устаревшие
     for jobId, e in pairs(Entries) do
         if (now - e.lastSeen) > ENTRY_TTL_SEC then
             removeEntry(jobId)
@@ -485,16 +487,28 @@ local function parseAll(raw)
     end
 
     refreshListVisual()
+    if DEBUG_NETWORK then
+        print(("[Floppa] kept=%d, entries=%d"):format((function() local c=0 for _ in pairs(best) do c+=1 end return c end)(), (function() local c=0 for _ in pairs(Entries) do c+=1 end return c end)()))
+    end
 end
 
 -- запрос с fallback (с ключом/без ключа)
+local function buildURL(withKey)
+    if withKey == false then return SERVER_URL end
+    local sep = SERVER_URL:find("?") and "&" or "?"
+    return SERVER_URL .. sep .. "key=" .. tostring(API_KEY)
+end
 local function pullOnce()
     local ok, body = pcall(function() return game:HttpGet(buildURL(true)) end)
     if not ok or type(body)~="string" or #body==0 then
+        if DEBUG_NETWORK then warn("[Floppa] key-request failed, trying without key…") end
         ok, body = pcall(function() return game:HttpGet(buildURL(false)) end)
     end
     if ok and type(body)=="string" and #body>0 then
+        if DEBUG_NETWORK then print("[Floppa] got bytes:", #body) end
         parseAll(body)
+    elseif DEBUG_NETWORK then
+        warn("[Floppa] empty/failed response")
     end
 end
 
