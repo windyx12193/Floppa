@@ -1,9 +1,8 @@
 --[[
-  FLOPPA AUTO JOINER v5 (stable)
-  • Фиолетовый GUI, лёгкий блюр, фиксированный хоткей T
-  • AUTO INJECT: очередь на телепорт + keep-alive каждые 5с + повтор при Teleport
-  • Локальный конфиг: workspace/.floppa_aj/config.txt (минимальный текст)
-  • Максимальная совместимость: без bit32/шифрования и двусмысленного синтаксиса
+  FLOPPA AUTO JOINER v5.2 (robust)
+  • Фиолетовый GUI, лёгкий блюр, хоткей T
+  • AUTO INJECT: очередь с ретраями в бутстрапе + keep-alive + хук на Teleport
+  • Локальный конфиг: floppa_aj/config.txt (минимальный текст)
 ]]
 
 ---------------- USER SETTINGS ----------------
@@ -24,7 +23,7 @@ local ok_main, topErr = pcall(function()
     -- =================================================================================
     -- CONFIG (plain text, maximum compatibility)
     -- =================================================================================
-    local CFG_DIR = "workspace/.floppa_aj"
+    local CFG_DIR = "floppa_aj"                  -- <— корень экзекутора
     local CFG_TXT = CFG_DIR .. "/config.txt"
 
     local function hasFS()
@@ -226,7 +225,7 @@ local ok_main, topErr = pcall(function()
 
     local header=Instance.new("Frame"); header.Size=UDim2.new(1,0,0,48); header.BackgroundColor3=COLORS.surface2; header.BackgroundTransparency=ALPHA.card; header.Parent=main
     roundify(header,10); stroke(header); padding(header,14,6,14,6)
-    mkLabel(header,"FLOPPA AUTO JOINER v5",20,"bold",COLORS.textPrimary).Size=UDim2.new(0.7,0,1,0)
+    mkLabel(header,"FLOPPA AUTO JOINER v5.2",20,"bold",COLORS.textPrimary).Size=UDim2.new(0.7,0,1,0)
     local hk=mkLabel(header,"OPEN GUI KEY:  T",16,"medium",COLORS.textWeak); hk.AnchorPoint=Vector2.new(1,0.5); hk.Position=UDim2.new(1,-14,0.5,0); hk.Size=UDim2.new(0.28,0,1,0); hk.TextXAlignment=Enum.TextXAlignment.Right
 
     local left=Instance.new("ScrollingFrame"); left.Size=UDim2.new(0,300,1,-58); left.Position=UDim2.new(0,0,0,58); left.BackgroundTransparency=1
@@ -255,22 +254,6 @@ local ok_main, topErr = pcall(function()
 
     -- Right (пример списка)
     mkHeader(right,"AVAILABLE LOBBIES").Size=UDim2.new(1,0,0,40)
-    local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; scroll.Size=UDim2.new(1,0,1,-50); scroll.Position=UDim2.new(0,0,0,46)
-    scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent=right
-    local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
-    local function addLobbyItem(nameText, moneyPerSec)
-        local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel
-        item.Parent=scroll; roundify(item,10); stroke(item, COLORS.purpleSoft, 1, 0.35); padding(item,12,6,12,6)
-        mkLabel(item, string.upper(nameText), 18, "bold", COLORS.textPrimary).Size=UDim2.new(0.5,-10,1,0)
-        local moneyLbl=mkLabel(item, string.upper(moneyPerSec), 17, "medium", Color3.fromRGB(130,255,130))
-        moneyLbl.AnchorPoint=Vector2.new(0.5,0.5); moneyLbl.Position=UDim2.new(0.62,0,0.5,0); moneyLbl.Size=UDim2.new(0.34,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Center
-        local joinBtn=Instance.new("TextButton"); joinBtn.Text="JOIN"; setFont(joinBtn,"bold"); joinBtn.TextSize=18; joinBtn.TextColor3=Color3.fromRGB(22,22,22)
-        joinBtn.AutoButtonColor=true; joinBtn.BackgroundColor3=COLORS.joinBtn; joinBtn.Size=UDim2.new(0,84,0,36); joinBtn.AnchorPoint=Vector2.new(1,0.5); joinBtn.Position=UDim2.new(1,-8,0.5,0)
-        roundify(joinBtn,10); stroke(joinBtn, Color3.fromRGB(0,0,0), 1, 0.7); joinBtn.Parent=item
-        joinBtn.MouseButton1Click:Connect(function() print("[JOIN] ->", nameText) end)
-        task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
-    end
-    for i=1,8 do addLobbyItem("BRAINROT NAME "..i, "MONEY/SECOND") end
 
     -- =================================================================================
     -- STATE + persistence
@@ -281,18 +264,19 @@ local ok_main, topErr = pcall(function()
     }
     do
         local cfg = cfg_load()
-        if cfg then
-            State = cfg
-        end
+        if cfg then State = cfg end
     end
 
     -- apply to UI (instant)
-    apply_AutoJoin(State.AutoJoin, true)
-    apply_AutoInject(State.AutoInject, true)
-    apply_IgnoreEn(State.IgnoreEnabled, true)
-    box_JoinRetry.Text  = tostring(State.JoinRetry)
-    box_MinMS.Text      = tostring(State.MinMS)
-    box_IgnoreNames.Text= table.concat(State.IgnoreNames, ",")
+    local function applyAll()
+        apply_AutoJoin(State.AutoJoin, true)
+        apply_AutoInject(State.AutoInject, true)
+        apply_IgnoreEn(State.IgnoreEnabled, true)
+        box_JoinRetry.Text  = tostring(State.JoinRetry)
+        box_MinMS.Text      = tostring(State.MinMS)
+        box_IgnoreNames.Text= table.concat(State.IgnoreNames, ",")
+    end
+    applyAll()
 
     local function persist() cfg_save(State) end
 
@@ -320,19 +304,21 @@ local ok_main, topErr = pcall(function()
         return q
     end
 
+    -- Мини-бутстрап с ретраями до 30с (на новом сервере)
     local function makeBootstrap(url)
         url = tostring(url or "")
         local s=""
         s=s.."task.spawn(function()\n"
         s=s.."  if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end\n"
         s=s.."  local okP,Pl=pcall(function() return game:GetService('Players') end)\n"
-        s=s.."  if okP and Pl then local t0=os.clock(); while not Pl.LocalPlayer and os.clock()-t0<10 do task.wait(0.05) end end\n"
+        s=s.."  if okP and Pl then local t0=os.clock(); while not Pl.LocalPlayer and os.clock()-t0<15 do task.wait(0.05) end end\n"
         s=s.."  pcall(function() getgenv().__FLOPPA_UI_ACTIVE=nil end)\n"
-        s=s.."  local function safeget(u)\n"
-        s=s.."    for i=1,3 do local ok,res=pcall(function() return game:HttpGet(u) end); if ok and type(res)=='string' and #res>0 then return res end; task.wait(1) end\n"
+        s=s.."  local deadline=os.clock()+30\n"
+        s=s.."  while os.clock()<deadline do\n"
+        s=s.."    local ok,res=pcall(function() return game:HttpGet('"..AUTO_INJECT_URL.."') end)\n"
+        s=s.."    if ok and type(res)=='string' and #res>0 then local f=loadstring(res); if f then local ok2,er=pcall(f); if ok2 then break end end end\n"
+        s=s.."    task.wait(3)\n"
         s=s.."  end\n"
-        s=s.."  local src=safeget('"..AUTO_INJECT_URL.."')\n"
-        s=s.."  if src then local f=loadstring(src); if f then pcall(f) end end\n"
         s=s.."end)\n"
         return s
     end
@@ -353,12 +339,13 @@ local ok_main, topErr = pcall(function()
     task.defer(function()
         if State.AutoInject then
             safeQueue(AUTO_INJECT_URL, "startup")
+            -- keep-alive (на случай, если экзекутор теряет очередь)
             task.spawn(function()
                 while gui and gui.Parent and State.AutoInject do
-                    if os.clock() - lastQueued > 15 then
+                    if os.clock() - lastQueued > 12 then
                         safeQueue(AUTO_INJECT_URL, "keepalive")
                     end
-                    task.wait(5)
+                    task.wait(4)
                 end
             end)
         end
@@ -394,7 +381,13 @@ local ok_main, topErr = pcall(function()
     local opened=true
     local function setVisible(v, instant)
         opened=v
-        if v then setBlur(true) else setBlur(false) end
+        if v then
+            -- ВАЖНО: показываем GUI при каждом старте
+            TweenService:Create(Lighting, TweenInfo.new(0, Enum.EasingStyle.Linear), {}):Play()
+            setBlur(true)
+        else
+            setBlur(false)
+        end
         local goal=v and UDim2.new(0.5,-490,0.5,-280) or UDim2.new(0.5,-490,1,30)
         if instant then
             main.Position=goal; main.Visible=v
@@ -408,6 +401,8 @@ local ok_main, topErr = pcall(function()
         if not gp and input.KeyCode==FIXED_HOTKEY then setVisible(not opened,false) end
     end)
     makeDraggable(main, header)
+
+    -- автопоказ при запуске
     task.defer(function() updateLeftCanvas(); setVisible(true,true) end)
 end)
 
