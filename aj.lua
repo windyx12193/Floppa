@@ -1,5 +1,5 @@
 --[[
-  FLOPPA AUTO JOINER - Luau-safe v4.6
+  FLOPPA AUTO JOINER - Luau-safe v4.6 (with JSON config)
   • Горячая клавиша фиксирована: T (англ.), ребинда нет
   • Надёжный авто-реинжект: только queue_on_teleport (без "run now")
   • Bootstrap ждёт game:IsLoaded() и LocalPlayer, сбрасывает __FLOPPA_UI_ACTIVE → без дублей и крашей
@@ -48,7 +48,7 @@ do
         if old then pcall(function() old:Destroy() end) end
     end
     local G = (getgenv and getgenv()) or _G
-    G.__FLOPPA_UI_ACTIVE = true -- информативно, не блокирует
+    G.__FLOPPA_UI_ACTIVE = true -- информативно
 end
 
 -- === Services ===
@@ -105,7 +105,7 @@ local function mkToggle(parent, text, default)
     sw.Size=UDim2.new(0,62,0,28); sw.AnchorPoint=Vector2.new(1,0.5); sw.Position=UDim2.new(1,-6,0.5,0); sw.Parent=row
     roundify(sw,14); stroke(sw, COLORS.purpleSoft, 1, 0.35)
     local dot=Instance.new("Frame"); dot.Size=UDim2.new(0,24,0,24); dot.Position=UDim2.new(0,2,0.5,-12); dot.BackgroundColor3=COLORS.off; dot.Parent=sw; roundify(dot,12)
-    local state={Value=default and true or false}
+    local state={Value=default and true or false, Changed=nil}
     local function apply(v, instant)
         state.Value=v
         local pos = v and UDim2.new(1,-26,0.5,-12) or UDim2.new(0,2,0.5,-12)
@@ -210,22 +210,6 @@ local ignoreRow, ignoreState, ignoreBox = mkStackInput(left, "IGNORE NAMES", "na
 
 -- === Demo list ===
 local listHeader=mkHeader(right,"AVAILABLE LOBBIES"); listHeader.Size=UDim2.new(1,0,0,40)
-local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; scroll.Size=UDim2.new(1,0,1,-50); scroll.Position=UDim2.new(0,0,0,46)
-scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent=right
-local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
-local function addLobbyItem(nameText, moneyPerSec)
-    local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel
-    item.Parent=scroll; roundify(item,10); stroke(item, COLORS.purpleSoft, 1, 0.35); padding(item,12,6,12,6)
-    local nameLbl=mkLabel(item, string.upper(nameText), 18, "bold", COLORS.textPrimary); nameLbl.Size=UDim2.new(0.5,-10,1,0)
-    local moneyLbl=mkLabel(item, string.upper(moneyPerSec), 17, "medium", Color3.fromRGB(130,255,130))
-    moneyLbl.AnchorPoint=Vector2.new(0.5,0.5); moneyLbl.Position=UDim2.new(0.62,0,0.5,0); moneyLbl.Size=UDim2.new(0.34,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Center
-    local joinBtn=Instance.new("TextButton"); joinBtn.Text="JOIN"; setFont(joinBtn,"bold"); joinBtn.TextSize=18; joinBtn.TextColor3=Color3.fromRGB(22,22,22)
-    joinBtn.AutoButtonColor=true; joinBtn.BackgroundColor3=COLORS.joinBtn; joinBtn.Size=UDim2.new(0,84,0,36); joinBtn.AnchorPoint=Vector2.new(1,0.5); joinBtn.Position=UDim2.new(1,-8,0.5,0)
-    roundify(joinBtn,10); stroke(joinBtn, Color3.fromRGB(0,0,0), 1, 0.7); joinBtn.Parent=item
-    joinBtn.MouseButton1Click:Connect(function() print("[JOIN] ->", nameText) end)
-    task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
-end
-for i=1,10 do addLobbyItem("BRAINROT NAME "..i, "MONEY/SECOND") end
 
 -- === State + persistence ===
 local State = {
@@ -237,6 +221,28 @@ local State = {
 local LOADING = true
 local function parseIgnore(s) local r={} for token in string.gmatch(s or "", "([^,%s]+)") do table.insert(r, token) end return r end
 local function joinIgnore(t) return table.concat(t or {}, ",") end
+
+-- загрузка конфига и ПРИМЕНЕНИЕ К UI
+do
+    local cfg = loadJSON(SETTINGS_PATH)
+    if cfg then
+        State.AutoJoin      = cfg.AutoJoin and true or false
+        State.AutoInject    = cfg.AutoInject and true or false
+        State.IgnoreEnabled = cfg.IgnoreEnabled and true or false
+        State.JoinRetry     = tonumber(cfg.JoinRetry) or State.JoinRetry
+        State.MinMS         = tonumber(cfg.MinMS) or State.MinMS
+        State.IgnoreNames   = type(cfg.IgnoreNames)=="table" and cfg.IgnoreNames or State.IgnoreNames
+
+        -- применяем визуально:
+        applyAutoJoin(State.AutoJoin, true)
+        applyAutoInject(State.AutoInject, true)
+        applyIgnoreToggle(State.IgnoreEnabled, true)
+        jrBox.Text = tostring(State.JoinRetry)
+        msBox.Text = tostring(State.MinMS)
+        ignoreBox.Text = joinIgnore(State.IgnoreNames)
+    end
+end
+
 local function saveSettings()
     if LOADING then return end
     local payload = {
@@ -249,30 +255,14 @@ local function saveSettings()
     }
     saveJSON(SETTINGS_PATH, payload)
 end
+
 autoJoin.Changed      = function(v) State.AutoJoin = v; saveSettings() end
 autoInject.Changed    = function(v) State.AutoInject = v; saveSettings() end
 ignoreToggle.Changed  = function(v) State.IgnoreEnabled = v; saveSettings() end
 jrBox.FocusLost:Connect(function() State.JoinRetry = tonumber(jrBox.Text) or State.JoinRetry; saveSettings() end)
 msBox.FocusLost:Connect(function() State.MinMS    = tonumber(msBox.Text) or State.MinMS;    saveSettings() end)
 ignoreState.Changed   = function(text) State.IgnoreNames = parseIgnore(text); saveSettings() end
-do
-    local cfg = loadJSON(SETTINGS_PATH)
-    if cfg then
-        State.AutoJoin      = cfg.AutoJoin and true or false
-        State.AutoInject    = cfg.AutoInject and true or false
-        State.IgnoreEnabled = cfg.IgnoreEnabled and true or false
-        State.JoinRetry     = tonumber(cfg.JoinRetry) or State.JoinRetry
-        State.MinMS         = tonumber(cfg.MinMS) or State.MinMS
-        State.IgnoreNames   = type(cfg.IgnoreNames)=="table" and cfg.IgnoreNames or State.IgnoreNames
-        jrBox.Text = tostring(State.JoinRetry)
-        msBox.Text = tostring(State.MinMS)
-        ignoreBox.Text = joinIgnore(State.IgnoreNames)
-        -- Применим визуально тумблеры:
-        task.defer(function()
-            for _,row in ipairs(left:GetChildren()) do end -- no-op; визуально уже в дефолте
-        end)
-    end
-end
+
 LOADING=false; saveSettings()
 
 -- === Auto Inject (Только очередь, без "run now") ===
@@ -311,13 +301,13 @@ local function queueReinject(url)
     if q and url~="" then q(makeBootstrap(url)) end
 end
 
--- ставим/снимаем очередь при клике
+-- ставим/снимаем очередь при клике (без немедленного запуска)
 autoInject.Changed = function(v)
     State.AutoInject = v; saveSettings()
-    -- ничего не выполняем сразу; если включено — при следующем телепорте скрипт поднимется сам
+    -- если включили — очередь уже поставится при следующем телепорте
 end
 
--- При старте, если тумблер был включён — уже сейчас поставим очередь на следующий телепорт
+-- При старте, если тумблер был включён — ставим очередь на следующий телепорт
 if State.AutoInject then queueReinject(AUTO_INJECT_URL) end
 
 -- Телепорт → ставим очередь ещё раз
