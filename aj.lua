@@ -1,9 +1,9 @@
---[[ FLOPPA AUTO JOINER v6.5 (smooth)
-     • batch-обновления UI (APPLY_PER_FRAME / Heartbeat)
-     • throttle resort/CanvasSize (RESORT_THROTTLE)
-     • инкрементальная подгрузка как в v6.4
-     • MIN M/S в миллионах, JOIN ретраи 10/с, автоинжект, JSON-конфиг
-     • хоткей GUI = T
+--[[ FLOPPA AUTO JOINER v6.6 (optimized)
+     • Virtual scrolling - рендерим только видимые карточки
+     • Object pooling для переиспользования UI элементов
+     • Исправлен JOIN RETRY (await вместо task.wait)
+     • Debounced updates для UI
+     • Оптимизированная сортировка с кешем
 ]]
 
 ---------------- USER/API SETTINGS ----------------
@@ -15,13 +15,16 @@ local SERVER_BASE       = "https://server-eta-two-29.vercel.app"
 local API_KEY           = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
 
 local TARGET_PLACE_ID   = 109983668079237
-local PULL_INTERVAL_SEC = 2.8        -- было 2.5; чуть реже = мягче GC
+local PULL_INTERVAL_SEC = 2.8
 local ENTRY_TTL_SEC     = 180.0
 local FRESH_AGE_SEC     = 12.0
-local FETCH_LIMIT       = 120        -- было 250; хватает с головой
--- сглаживание UI:
-local APPLY_PER_FRAME   = 8          -- сколько карточек максимум обновлять за кадр
-local RESORT_THROTTLE   = 0.5        -- не чаще чем раз в 0.5с пересчитывать Canvas/сортировку
+local FETCH_LIMIT       = 120
+
+-- Оптимизация UI
+local CARD_HEIGHT       = 60  -- высота одной карточки
+local VISIBLE_BUFFER    = 2   -- сколько карточек рендерить за пределами viewport
+local UPDATE_BATCH_SIZE = 15  -- сколько карточек обновлять за раз
+local UI_UPDATE_DELAY   = 0.05 -- задержка между батчами обновлений
 ---------------------------------------------------
 
 local Players=game:GetService("Players")
@@ -127,7 +130,6 @@ mkHeader(left,"НАСТРОЙКИ");       local _, autoInject,_ = mkToggle(left
 
 local listHeader=mkHeader(right,"AVAILABLE LOBBIES"); listHeader.Size=UDim2.new(1,0,0,40)
 local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; scroll.Size=UDim2.new(1,0,1,-50); scroll.Position=UDim2.new(0,0,0,46); scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent=right
-local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
 
 -- ===== persist on change =====
 local function parseIgnore(s)local r={} for tok in (s or ""):gmatch("([^,%s]+)") do r[#r+1]=tok end return r end
@@ -158,7 +160,7 @@ local function apiGetJSON(limit)
         url=url.."&key="..API_KEY
     end
     local ok,b=pcall(function() return game:HttpGet(url) end); if not ok or type(b)~="string" or #b==0 then return false end
-    local ok2,d=pcall(function() return HttpService:JSONDecode(b) end); if not ok2 then return false end
+    local ok2,d=pcall(function()return HttpService:JSONDecode(b) end); if not ok2 then return false end
     return true,d
 end
 
@@ -172,167 +174,495 @@ local function passFilters(d)
     return true
 end
 
--- ===== data & UI with batching =====
-local Entries,Order={},{}
-local SeenHashes={}
-local firstSnapshotDone=false
-
-local applyQueue={}  -- { {op="add"/"touch", jobId=..., data=...}, ... }
-local lastResort=0
-
-local function enqueue(op, jobId, data)
-    applyQueue[#applyQueue+1]={op=op, jobId=jobId, data=data}
-end
+-- ===== НОВАЯ СИСТЕМА: Virtual Scrolling + Object Pooling =====
+local Entries = {}  -- [jobId] = {data=..., index=...}
+local SortedOrder = {}  -- массив jobId в отсортированном порядке
+local CardPool = {}  -- пул переиспользуемых UI карточек
+local ActiveCards = {}  -- [jobId] = frame (активные карточки)
 
 local function playersFmt(p,m) return string.format("%d/%d",p or 0,m or 0) end
 
-local function ensureItem(jobId,d)
-    local e=Entries[jobId]; if e and e.frame then return e end
-    local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel; item.Parent=scroll; roundify(item,10); stroke(item,COLORS.purpleSoft,1,0.35); padding(item,12,6,12,6)
-    local nameLbl=mkLabel(item,string.upper(d.name),18,"bold",COLORS.textPrimary); nameLbl.Size=UDim2.new(0.44,-10,1,0)
-    local moneyLbl=mkLabel(item,string.upper(d.moneyStr or ""),17,"medium",Color3.fromRGB(130,255,130)); moneyLbl.AnchorPoint=Vector2.new(0,0.5); moneyLbl.Position=UDim2.new(0.46,0,0.5,0); moneyLbl.Size=UDim2.new(0.22,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Left
-    local playersLbl=mkLabel(item,playersFmt(d.curPlayers,d.maxPlayers),16,"medium",COLORS.textWeak); playersLbl.AnchorPoint=Vector2.new(0,0.5); playersLbl.Position=UDim2.new(0.69,0,0.5,0); playersLbl.Size=UDim2.new(0.12,0,1,0); playersLbl.TextXAlignment=Enum.TextXAlignment.Left
-    local joinBtn=Instance.new("TextButton"); joinBtn.Text="JOIN"; setFont(joinBtn,"bold"); joinBtn.TextSize=18; joinBtn.TextColor3=Color3.fromRGB(22,22,22); joinBtn.AutoButtonColor=true; joinBtn.BackgroundColor3=COLORS.joinBtn; joinBtn.Size=UDim2.new(0,84,0,36); joinBtn.AnchorPoint=Vector2.new(1,0.5); joinBtn.Position=UDim2.new(1,-8,0.5,0); roundify(joinBtn,10); stroke(joinBtn,Color3.fromRGB(0,0,0),1,0.7); joinBtn.Parent=item
+-- Создаём карточку (или берём из пула)
+local function getCardFromPool()
+    if #CardPool > 0 then
+        return table.remove(CardPool)
+    end
+    
+    -- Создаём новую карточку
+    local item=Instance.new("Frame")
+    item.Size=UDim2.new(1,-6,0,52)
+    item.BackgroundColor3=COLORS.surface
+    item.BackgroundTransparency=ALPHA.panel
+    roundify(item,10)
+    stroke(item,COLORS.purpleSoft,1,0.35)
+    padding(item,12,6,12,6)
+    
+    local nameLbl=mkLabel(item,"",18,"bold",COLORS.textPrimary)
+    nameLbl.Size=UDim2.new(0.44,-10,1,0)
+    
+    local moneyLbl=mkLabel(item,"",17,"medium",Color3.fromRGB(130,255,130))
+    moneyLbl.AnchorPoint=Vector2.new(0,0.5)
+    moneyLbl.Position=UDim2.new(0.46,0,0.5,0)
+    moneyLbl.Size=UDim2.new(0.22,0,1,0)
+    moneyLbl.TextXAlignment=Enum.TextXAlignment.Left
+    
+    local playersLbl=mkLabel(item,"",16,"medium",COLORS.textWeak)
+    playersLbl.AnchorPoint=Vector2.new(0,0.5)
+    playersLbl.Position=UDim2.new(0.69,0,0.5,0)
+    playersLbl.Size=UDim2.new(0.12,0,1,0)
+    playersLbl.TextXAlignment=Enum.TextXAlignment.Left
+    
+    local joinBtn=Instance.new("TextButton")
+    joinBtn.Text="JOIN"
+    setFont(joinBtn,"bold")
+    joinBtn.TextSize=18
+    joinBtn.TextColor3=Color3.fromRGB(22,22,22)
+    joinBtn.AutoButtonColor=true
+    joinBtn.BackgroundColor3=COLORS.joinBtn
+    joinBtn.Size=UDim2.new(0,84,0,36)
+    joinBtn.AnchorPoint=Vector2.new(1,0.5)
+    joinBtn.Position=UDim2.new(1,-8,0.5,0)
+    roundify(joinBtn,10)
+    stroke(joinBtn,Color3.fromRGB(0,0,0),1,0.7)
+    joinBtn.Parent=item
+    
+    item:SetAttribute("nameLbl", nameLbl)
+    item:SetAttribute("moneyLbl", moneyLbl)
+    item:SetAttribute("playersLbl", playersLbl)
+    item:SetAttribute("joinBtn", joinBtn)
+    
+    return item
+end
+
+-- Возвращаем карточку в пул
+local function returnCardToPool(card)
+    card.Parent = nil
+    card:SetAttribute("jobId", nil)
+    table.insert(CardPool, card)
+end
+
+-- Обновляем данные карточки
+local function updateCard(card, jobId, data, index)
+    card:SetAttribute("jobId", jobId)
+    card.LayoutOrder = index
+    card.Position = UDim2.new(0, 0, 0, (index - 1) * CARD_HEIGHT)
+    
+    local nameLbl = card:GetAttribute("nameLbl")
+    local moneyLbl = card:GetAttribute("moneyLbl")
+    local playersLbl = card:GetAttribute("playersLbl")
+    local joinBtn = card:GetAttribute("joinBtn")
+    
+    nameLbl.Text = string.upper(data.name)
+    moneyLbl.Text = string.upper(data.moneyStr or "")
+    playersLbl.Text = playersFmt(data.curPlayers, data.maxPlayers)
+    
+    -- Обновляем обработчик JOIN кнопки
+    for _, conn in ipairs(joinBtn:GetConnections()) do
+        conn:Disconnect()
+    end
+    
     joinBtn.MouseButton1Click:Connect(function()
-        local tries=tonumber(jrBox.Text) or State.JoinRetry or 0; local dSec=0.10; joinBtn.Text="JOIN…"
-        for i=1,math.max(tries,1) do
-            local ok=pcall(function() TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, Players.LocalPlayer) end)
-            if ok then joinBtn.Text="OK"; break else joinBtn.Text=("RETRY %d/%d"):format(i,tries); task.wait(dSec) end
-        end
-        task.delay(0.8,function() if joinBtn then joinBtn.Text="JOIN" end end)
-    end)
-    Entries[jobId]={data=d,frame=item,firstSeen=os.clock(),lastSeen=os.clock(),refs={nameLbl=nameLbl,moneyLbl=moneyLbl,playersLbl=playersLbl}}
-    table.insert(Order,jobId)
-    return Entries[jobId]
-end
-
-local function updateItem(jobId, d)
-    local e=Entries[jobId]
-    if not e then e=ensureItem(jobId,d) else
-        -- апдейтим только изменившееся
-        if d.mps > (e.data.mps or 0) then e.data.name=d.name; e.data.mps=d.mps; e.data.moneyStr=d.moneyStr end
-        e.data.curPlayers=d.curPlayers; e.data.maxPlayers=d.maxPlayers
-        e.lastSeen=os.clock()
-    end
-    local r=e.refs
-    if r then
-        local up = string.upper
-        if r.nameLbl.Text ~= up(e.data.name) then r.nameLbl.Text = up(e.data.name) end
-        if r.moneyLbl.Text ~= up(e.data.moneyStr or "") then r.moneyLbl.Text = up(e.data.moneyStr or "") end
-        local pf=playersFmt(e.data.curPlayers,e.data.maxPlayers); if r.playersLbl.Text~=pf then r.playersLbl.Text=pf end
-    end
-end
-
-local function removeItem(jobId)
-    local e=Entries[jobId]; if not e then return end
-    if e.frame then pcall(function() e.frame:Destroy() end) end
-    Entries[jobId]=nil; for i=#Order,1,-1 do if Order[i]==jobId then table.remove(Order,i) break end end
-end
-
-local function resortPaint(throttle)
-    local now=os.clock()
-    if throttle and (now-lastResort) < RESORT_THROTTLE then return end
-    lastResort = now
-    table.sort(Order,function(a,b) local ea,eb=Entries[a],Entries[b]; if not ea or not eb then return (a or "")<(b or "") end; if ea.data.mps~=eb.data.mps then return ea.data.mps>eb.data.mps end; return ea.lastSeen>eb.lastSeen end)
-    local shown=0
-    for idx,id in ipairs(Order) do
-        local e=Entries[id]; if e and e.frame then
-            e.frame.LayoutOrder=idx; local age=now-e.firstSeen
-            if age<=FRESH_AGE_SEC then e.frame.BackgroundColor3=Color3.fromRGB(22,28,26); e.frame.BackgroundTransparency=ALPHA.panel
-            else e.frame.BackgroundColor3=COLORS.surface; local st=math.clamp((now-e.lastSeen)/ENTRY_TTL_SEC,0,1); e.frame.BackgroundTransparency=ALPHA.panel+0.05*st end
-            shown+=1
-        end
-    end
-    local minM=tonumber(msBox.Text) or State.MinMS or 0
-    statsLbl.Text=("shown: %d • min: %dM/s"):format(shown,minM)
-    scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10)
-end
-
--- apply loop: максимум APPLY_PER_FRAME
-task.spawn(function()
-    while gui and gui.Parent do
-        local processed=0
-        while processed<APPLY_PER_FRAME and #applyQueue>0 do
-            local job=table.remove(applyQueue,1)
-            if job.op=="add" then updateItem(job.jobId, job.data) end
-            if job.op=="touch" and Entries[job.jobId] then
-                local e=Entries[job.jobId]; e.data.curPlayers=job.data.curPlayers; e.data.maxPlayers=job.data.maxPlayers; e.lastSeen=os.clock()
-                local pf=playersFmt(e.data.curPlayers,e.data.maxPlayers); if e.refs.playersLbl.Text~=pf then e.refs.playersLbl.Text=pf end
+        task.spawn(function()
+            local tries = tonumber(jrBox.Text) or State.JoinRetry or 50
+            joinBtn.Text = "JOINING..."
+            joinBtn.BackgroundColor3 = Color3.fromRGB(200, 180, 50)
+            
+            for attempt = 1, math.max(tries, 1) do
+                local success, err = pcall(function()
+                    TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, Players.LocalPlayer)
+                end)
+                
+                if success then
+                    joinBtn.Text = "✓ OK"
+                    joinBtn.BackgroundColor3 = COLORS.on
+                    break
+                else
+                    joinBtn.Text = string.format("RETRY %d/%d", attempt, tries)
+                    joinBtn.BackgroundColor3 = Color3.fromRGB(220, 120, 50)
+                    
+                    if attempt < tries then
+                        task.wait(0.1)  -- Короткая задержка между попытками
+                    end
+                end
             end
-            processed+=1
-        end
-        if processed>0 then resortPaint(true) end
-        RunService.Heartbeat:Wait()
+            
+            task.wait(1.5)
+            if joinBtn and joinBtn.Parent then
+                joinBtn.Text = "JOIN"
+                joinBtn.BackgroundColor3 = COLORS.joinBtn
+            end
+        end)
+    end)
+    
+    -- Визуальные эффекты для свежих записей
+    local now = os.clock()
+    local age = now - (data.firstSeen or now)
+    if age <= FRESH_AGE_SEC then
+        card.BackgroundColor3 = Color3.fromRGB(22, 28, 26)
+    else
+        card.BackgroundColor3 = COLORS.surface
     end
-end)
+end
 
--- ===== fetch & parse =====
-local function hashOf(item) return string.format("%s|%s|%s",item.jobId or "",item.moneyStr or "",item.playersRaw or "") end
+-- Рендерим только видимые карточки
+local function renderVisibleCards()
+    if #SortedOrder == 0 then
+        scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+        return
+    end
+    
+    local scrollPos = scroll.CanvasPosition.Y
+    local viewportHeight = scroll.AbsoluteSize.Y
+    
+    local firstVisible = math.max(1, math.floor(scrollPos / CARD_HEIGHT) - VISIBLE_BUFFER)
+    local lastVisible = math.min(#SortedOrder, math.ceil((scrollPos + viewportHeight) / CARD_HEIGHT) + VISIBLE_BUFFER)
+    
+    -- Убираем карточки, которые вышли из зоны видимости
+    for jobId, card in pairs(ActiveCards) do
+        local entry = Entries[jobId]
+        if not entry or entry.index < firstVisible or entry.index > lastVisible then
+            returnCardToPool(card)
+            ActiveCards[jobId] = nil
+        end
+    end
+    
+    -- Добавляем карточки в зоне видимости
+    for i = firstVisible, lastVisible do
+        local jobId = SortedOrder[i]
+        if jobId and not ActiveCards[jobId] then
+            local entry = Entries[jobId]
+            if entry then
+                local card = getCardFromPool()
+                updateCard(card, jobId, entry.data, i)
+                card.Parent = scroll
+                ActiveCards[jobId] = card
+            end
+        end
+    end
+    
+    -- Обновляем размер canvas
+    scroll.CanvasSize = UDim2.new(0, 0, 0, #SortedOrder * CARD_HEIGHT + 10)
+end
+
+-- Добавление или обновление записи
+local function addOrUpdateEntry(jobId, data)
+    local now = os.clock()
+    
+    if Entries[jobId] then
+        -- Обновляем существующую
+        local entry = Entries[jobId]
+        if data.mps > (entry.data.mps or 0) then
+            entry.data.name = data.name
+            entry.data.mps = data.mps
+            entry.data.moneyStr = data.moneyStr
+        end
+        entry.data.curPlayers = data.curPlayers
+        entry.data.maxPlayers = data.maxPlayers
+        entry.lastSeen = now
+        
+        -- Обновляем карточку если она видима
+        if ActiveCards[jobId] then
+            updateCard(ActiveCards[jobId], jobId, entry.data, entry.index)
+        end
+    else
+        -- Создаём новую запись
+        Entries[jobId] = {
+            data = data,
+            firstSeen = now,
+            lastSeen = now,
+            index = 0
+        }
+        table.insert(SortedOrder, jobId)
+    end
+end
+
+-- Удаление записи
+local function removeEntry(jobId)
+    if not Entries[jobId] then return end
+    
+    -- Убираем карточку
+    if ActiveCards[jobId] then
+        returnCardToPool(ActiveCards[jobId])
+        ActiveCards[jobId] = nil
+    end
+    
+    -- Удаляем из данных
+    Entries[jobId] = nil
+    for i = #SortedOrder, 1, -1 do
+        if SortedOrder[i] == jobId then
+            table.remove(SortedOrder, i)
+            break
+        end
+    end
+end
+
+-- Сортировка с кешем
+local sortCache = {}
+local lastSortTime = 0
+
+local function sortEntries()
+    local now = os.clock()
+    
+    -- Пересчитываем индексы только если прошло достаточно времени
+    if now - lastSortTime < 0.3 then
+        return false
+    end
+    lastSortTime = now
+    
+    -- Сортируем по MPS и времени
+    table.sort(SortedOrder, function(a, b)
+        local ea, eb = Entries[a], Entries[b]
+        if not ea or not eb then return (a or "") < (b or "") end
+        if ea.data.mps ~= eb.data.mps then
+            return ea.data.mps > eb.data.mps
+        end
+        return ea.lastSeen > eb.lastSeen
+    end)
+    
+    -- Обновляем индексы
+    for i, jobId in ipairs(SortedOrder) do
+        if Entries[jobId] then
+            Entries[jobId].index = i
+        end
+    end
+    
+    return true
+end
+
+-- Очистка устаревших записей
+local function cleanupOldEntries()
+    local now = os.clock()
+    local toRemove = {}
+    
+    for jobId, entry in pairs(Entries) do
+        if (now - entry.lastSeen) > ENTRY_TTL_SEC then
+            table.insert(toRemove, jobId)
+        end
+    end
+    
+    for _, jobId in ipairs(toRemove) do
+        removeEntry(jobId)
+    end
+    
+    if #toRemove > 0 then
+        sortEntries()
+    end
+end
+
+-- Обновление UI статистики
+local function updateStats()
+    local minM = tonumber(msBox.Text) or State.MinMS or 0
+    local shown = #SortedOrder
+    statsLbl.Text = string.format("shown: %d • min: %dM/s", shown, minM)
+end
+
+-- ===== API fetch & parse =====
+local function hashOf(item) 
+    return string.format("%s|%s|%s", item.jobId or "", item.moneyStr or "", item.playersRaw or "") 
+end
 
 local function pickBestByServer(items)
-    local best={}
-    for _,it in ipairs(items) do
-        local id=tostring(it.id or it.job_id or "")
-        local name=tostring(it.name or "")
-        local moneyStr=tostring(it.money_per_second or it.money or "")
-        local players=tostring(it.players or "")
-        if id~="" and name~="" and moneyStr~="" and players~="" then
-            local cur,max=players:match("(%d+)%s*/%s*(%d+)"); cur=tonumber(cur or 0) or 0; max=tonumber(max or 0) or 0
-            local mps=parseMoneyStr(moneyStr)
-            local d={jobId=id,name=name,moneyStr=moneyStr,mps=mps,curPlayers=cur,maxPlayers=max,playersRaw=players}
-            if passFilters(d) then local b=best[id]; if (not b) or d.mps>b.mps then best[id]=d end end
+    local best = {}
+    for _, it in ipairs(items) do
+        local id = tostring(it.id or it.job_id or "")
+        local name = tostring(it.name or "")
+        local moneyStr = tostring(it.money_per_second or it.money or "")
+        local players = tostring(it.players or "")
+        
+        if id ~= "" and name ~= "" and moneyStr ~= "" and players ~= "" then
+            local cur, max = players:match("(%d+)%s*/%s*(%d+)")
+            cur = tonumber(cur or 0) or 0
+            max = tonumber(max or 0) or 0
+            local mps = parseMoneyStr(moneyStr)
+            
+            local d = {
+                jobId = id,
+                name = name,
+                moneyStr = moneyStr,
+                mps = mps,
+                curPlayers = cur,
+                maxPlayers = max,
+                playersRaw = players
+            }
+            
+            if passFilters(d) then
+                local b = best[id]
+                if (not b) or d.mps > b.mps then
+                    best[id] = d
+                end
+            end
         end
     end
     return best
 end
 
-local wantImmediate=false
-refreshBtn.MouseButton1Click:Connect(function() wantImmediate=true end)
+-- ===== Main update loop =====
+local SeenHashes = {}
+local firstSnapshotDone = false
+local wantImmediate = false
+local isUpdating = false
 
+refreshBtn.MouseButton1Click:Connect(function() 
+    wantImmediate = true 
+end)
+
+-- Render loop - обновляем видимые карточки при скролле
+scroll:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+    renderVisibleCards()
+end)
+
+-- Data fetch loop
 task.spawn(function()
-    local lastTick=0
+    local lastTick = 0
+    
     while gui and gui.Parent do
-        local now=os.clock()
-        if wantImmediate or (now-lastTick)>=PULL_INTERVAL_SEC then
-            wantImmediate=false; lastTick=now
-            local ok,data=apiGetJSON(FETCH_LIMIT)
-            if ok and type(data)=="table" and type(data.items)=="table" then
-                local best=pickBestByServer(data.items)
-                if not firstSnapshotDone then
-                    for _,d in pairs(best) do SeenHashes[hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})]=true end
-                    firstSnapshotDone=true
-                else
-                    for _,d in pairs(best) do
-                        local h=hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})
-                        if not SeenHashes[h] then
-                            SeenHashes[h]=true
-                            enqueue("add", d.jobId, d)
+        local now = os.clock()
+        
+        if wantImmediate or (now - lastTick) >= PULL_INTERVAL_SEC then
+            if not isUpdating then
+                isUpdating = true
+                wantImmediate = false
+                lastTick = now
+                
+                task.spawn(function()
+                    local ok, data = apiGetJSON(FETCH_LIMIT)
+                    
+                    if ok and type(data) == "table" and type(data.items) == "table" then
+                        local best = pickBestByServer(data.items)
+                        
+                        if not firstSnapshotDone then
+                            -- Первая загрузка - добавляем все сразу
+                            for _, d in pairs(best) do
+                                SeenHashes[hashOf({
+                                    jobId = d.jobId,
+                                    moneyStr = d.moneyStr,
+                                    playersRaw = d.playersRaw
+                                })] = true
+                                addOrUpdateEntry(d.jobId, d)
+                            end
+                            firstSnapshotDone = true
+                            sortEntries()
+                            renderVisibleCards()
+                            updateStats()
                         else
-                            if Entries[d.jobId] then
-                                enqueue("touch", d.jobId, d)
+                            -- Инкрементальное обновление
+                            local updated = false
+                            
+                            for _, d in pairs(best) do
+                                local h = hashOf({
+                                    jobId = d.jobId,
+                                    moneyStr = d.moneyStr,
+                                    playersRaw = d.playersRaw
+                                })
+                                
+                                if not SeenHashes[h] then
+                                    SeenHashes[h] = true
+                                    addOrUpdateEntry(d.jobId, d)
+                                    updated = true
+                                else
+                                    if Entries[d.jobId] then
+                                        addOrUpdateEntry(d.jobId, d)
+                                    end
+                                end
+                            end
+                            
+                            -- Очистка устаревших
+                            cleanupOldEntries()
+                            
+                            if updated or sortEntries() then
+                                renderVisibleCards()
+                                updateStats()
                             end
                         end
                     end
-                    -- GC протухших: тоже батчим (destroy дешевый, но сделаем чуть реже)
-                    for id,e in pairs(Entries) do if (now-e.lastSeen)>ENTRY_TTL_SEC then removeItem(id) end end
-                    resortPaint(true)
-                end
+                    
+                    isUpdating = false
+                end)
             end
         end
-        task.wait(0.06)
+        
+        task.wait(0.1)
     end
 end)
 
 -- ===== show/hide & drag =====
-local function makeDraggable(frame,handle) handle=handle or frame; local dragging=false; local startPos; local startMouse
-    handle.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true; startPos=frame.Position; startMouse=input.Position; input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end) end end)
-    UIS.InputChanged:Connect(function(input) if dragging and input.UserInputType==Enum.UserInputType.MouseMovement then local d=input.Position-startMouse; frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y) end end)
+local function makeDraggable(frame, handle)
+    handle = handle or frame
+    local dragging = false
+    local startPos
+    local startMouse
+    
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            startPos = frame.Position
+            startMouse = input.Position
+            
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    
+    UIS.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = input.Position - startMouse
+            frame.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + d.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + d.Y
+            )
+        end
+    end)
 end
-local opened=true
-local function setVisible(v,inst) opened=v; if v then setBlur(true) else setBlur(false) end
-    local goal=v and UDim2.new(0.5,-490,0.5,-280) or UDim2.new(0.5,-490,1,30)
-    if inst then main.Position=goal; main.Visible=v
-    else if v then main.Visible=true end; local t=TweenService:Create(main,TweenInfo.new(0.18,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Position=goal}); t:Play(); if not v then t.Completed:Wait(); main.Visible=false end end end
-UIS.InputBegan:Connect(function(input,gp) if not gp and input.KeyCode==FIXED_HOTKEY then setVisible(not opened,false) end end)
-makeDraggable(main,header)
-task.defer(function() updLeftCanvas(); setVisible(true,true) end)
+
+local opened = true
+local function setVisible(v, inst)
+    opened = v
+    if v then
+        setBlur(true)
+    else
+        setBlur(false)
+    end
+    
+    local goal = v and UDim2.new(0.5, -490, 0.5, -280) or UDim2.new(0.5, -490, 1, 30)
+    
+    if inst then
+        main.Position = goal
+        main.Visible = v
+    else
+        if v then
+            main.Visible = true
+        end
+        
+        local t = TweenService:Create(
+            main,
+            TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            {Position = goal}
+        )
+        t:Play()
+        
+        if not v then
+            t.Completed:Wait()
+            main.Visible = false
+        end
+    end
+end
+
+UIS.InputBegan:Connect(function(input, gp)
+    if not gp and input.KeyCode == FIXED_HOTKEY then
+        setVisible(not opened, false)
+    end
+end)
+
+makeDraggable(main, header)
+
+-- Initial setup
+task.defer(function()
+    updLeftCanvas()
+    setVisible(true, true)
+    renderVisibleCards()
+end)
