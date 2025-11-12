@@ -1,12 +1,3 @@
---[[ FLOPPA AUTO JOINER v6.4
-     • API: https://server-eta-two-29.vercel.app/api/jobs  (x-api-key)
-     • Старт с 0 серверов: первый срез помечается как seen, далее добавляются только новые
-     • Асинхронный пуллер + батч-апдейты UI (без микролагов); Refresh = мягкий триггер
-     • MIN M/S в МИЛЛИОНАХ; JOIN ретраи 10/сек; авто-реинжект; JSON-конфиг
-     • Хоткей GUI = T
-]]
-
----------------- USER/API SETTINGS ----------------
 local AUTO_INJECT_URL   = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
 local FIXED_HOTKEY      = Enum.KeyCode.T
 local SETTINGS_PATH     = "floppa_aj_settings.json"
