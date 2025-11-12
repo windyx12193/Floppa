@@ -1,7 +1,5 @@
--- == FLOPPA AUTO JOINER (lag-free + reliable join retry) ==
--- 1) Бюджетированное создание UI (чтобы не подвисал кадр при апдейте списка)
--- 2) SeenHashes с очисткой
--- 3) JOIN RETRY: TeleportInitFailed + OnTeleport(Failed) + watchdog, экспонентная задержка
+-- == FLOPPA AUTO JOINER (focus: JOIN RETRY + logging) ==
+-- Ретраи при GameFull/Failure/Timeout/ServiceUnavailable, экспонента и логи в консоль.
 
 local AUTO_INJECT_URL   = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
 local FIXED_HOTKEY      = Enum.KeyCode.T
@@ -11,11 +9,10 @@ local SERVER_BASE       = "https://server-eta-two-29.vercel.app"
 local API_KEY           = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
 
 local TARGET_PLACE_ID   = 109983668079237
-local PULL_INTERVAL_SEC = 2.5
-local ENTRY_TTL_SEC     = 180.0
-local FRESH_AGE_SEC     = 12.0
+local PULL_INTERVAL_SEC = 2.5         -- базовый интервал опроса
+local ENTRY_TTL_SEC     = 180.0        -- авто-удаление старше 3 минут
+local FRESH_AGE_SEC     = 12.0         -- подсветка «новых»
 local DEBUG             = false
-
 ---------------------------------------------------
 
 local Players          = game:GetService("Players")
@@ -24,9 +21,8 @@ local TweenService     = game:GetService("TweenService")
 local Lighting         = game:GetService("Lighting")
 local HttpService      = game:GetService("HttpService")
 local TeleportService  = game:GetService("TeleportService")
-local RunService       = game:GetService("RunService")
 
--- ==== FS helpers ====
+-- ==== FS helpers (config) ====
 local function hasFS() return typeof(writefile)=="function" and typeof(readfile)=="function" and typeof(isfile)=="function" end
 local function saveJSON(path, t)
     if not hasFS() then return false end
@@ -103,11 +99,11 @@ local function updLeftCanvas() left.CanvasSize=UDim2.new(0,0,0,leftList.Absolute
 local right=Instance.new("Frame"); right.Size=UDim2.new(1,-320,1,-58); right.Position=UDim2.new(0,320,0,58); right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card; right.Parent=main; roundify(right,12); stroke(right); padding(right,12,12,12,12)
 local statsLbl=mkLabel(right,"shown: 0 • min: "..tostring(State.MinMS).."M/s",13,"medium",COLORS.textWeak); statsLbl.AnchorPoint=Vector2.new(1,0); statsLbl.Position=UDim2.new(1,-10,0,8); statsLbl.Size=UDim2.new(0,280,0,16); statsLbl.TextXAlignment=Enum.TextXAlignment.Right
 
-local listHeader=mkHeader(left,"PRIORITY ACTIONS"); local _, autoJoin, _ = mkToggle(left,"AUTO JOIN",State.AutoJoin); local _,_,jrBox=mkStackInput(left,"JOIN RETRY","50",tostring(State.JoinRetry),true)
+mkHeader(left,"PRIORITY ACTIONS"); local _, autoJoin, _ = mkToggle(left,"AUTO JOIN",State.AutoJoin); local _,_,jrBox=mkStackInput(left,"JOIN RETRY","50",tostring(State.JoinRetry),true)
 mkHeader(left,"MONEY FILTERS");   local _,_,msBox=mkStackInput(left,"MIN M/S","1 (= $1M/s)",tostring(State.MinMS),true)
 mkHeader(left,"НАСТРОЙКИ");       local _, autoInject, _ = mkToggle(left,"AUTO INJECT",State.AutoInject); local _, ignoreToggle, _ = mkToggle(left,"ENABLE IGNORE LIST",State.IgnoreEnabled); local _, ignoreState, ignoreBox=mkStackInput(left,"IGNORE NAMES","name1,name2,...",table.concat(State.IgnoreNames,","),false)
 
-local listHeader2=mkHeader(right,"AVAILABLE LOBBIES"); listHeader2.Size=UDim2.new(1,0,0,40)
+local listHeader=mkHeader(right,"AVAILABLE LOBBIES"); listHeader.Size=UDim2.new(1,0,0,40)
 local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; scroll.Size=UDim2.new(1,0,1,-50); scroll.Position=UDim2.new(0,0,0,46); scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent=right
 local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
 
@@ -126,7 +122,7 @@ ignoreToggle.Changed=function(v) State.IgnoreEnabled=v; persist() end
 jrBox.FocusLost:Connect(function() State.JoinRetry=tonumber(jrBox.Text) or State.JoinRetry; persist() end)
 msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; persist() end)
 ignoreState.Changed=function(txt) State.IgnoreNames=parseIgnore(txt); persist() end
-persist()
+persist() -- гарантированно создаём файл
 
 -- ==== AutoInject (queue only) ====
 local function pickQueue() local q=nil; pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end); if not q and type(queue_on_teleport)=="function" then q=queue_on_teleport end; if not q and type(queueteleport)=="function" then q=queueteleport end; if not q and type(fluxus)=="table" and type(fluxus.queue_on_teleport)=="function" then q=fluxus.queue_on_teleport end; return q end
@@ -135,7 +131,7 @@ local function queueReinject() local q=pickQueue(); if q then q(makeBootstrap())
 if State.AutoInject then queueReinject() end
 Players.LocalPlayer.OnTeleport:Connect(function(st) if autoInject.Value and st==Enum.TeleportState.Started then queueReinject() end end)
 
--- ==== Networking ====
+-- ==== Networking (x-api-key) ====
 local function getReqFn()
     return (syn and syn.request) or http_request or request or (fluxus and fluxus.request) or nil
 end
@@ -143,7 +139,7 @@ local function apiGetJSON(limit)
     local req = getReqFn()
     local url = string.format("%s/api/jobs?limit=%d&_cb=%d", SERVER_BASE, limit or 200, math.random(10^6,10^7))
     if req then
-        local res = req({ Url = url, Method = "GET", Headers = { ["x-api-key"]=API_KEY, ["Accept"]="application/json" }, Timeout=6 })
+        local res = req({ Url = url, Method = "GET", Headers = { ["x-api-key"]=API_KEY, ["Accept"]="application/json" } })
         if res and res.StatusCode == 200 and type(res.Body)=="string" then
             local ok, data = pcall(function() return HttpService:JSONDecode(res.Body) end)
             if ok then return true, data end
@@ -176,176 +172,148 @@ end
 
 -- ==== Entries, de-dupe & UI list ====
 local Entries, Order = {}, {}
-local SeenHashes = {}               -- [hash] = lastSeenTime
-local firstSnapshotDone = false
-local SEEN_HASH_MAX_AGE = 60.0
-
-local function purgeSeenHashes(maxAge)
-    local now = os.clock()
-    maxAge = maxAge or SEEN_HASH_MAX_AGE
-    for h, t in pairs(SeenHashes) do
-        if (now - t) > maxAge then
-            SeenHashes[h] = nil
-        end
-    end
-end
+local SeenHashes = {}               -- то, что уже было на момент первого снимка + всё, что мы показали
+local firstSnapshotDone = false     -- пока false — первый fetch просто помечает SeenHashes
 
 local function hashOf(item)
+    -- Хэш на связку jobId + moneyStr + players (на случай нескольких брейнротов на одном сервере)
     return string.format("%s|%s|%s", item.jobId or "", item.moneyStr or "", item.playersRaw or "")
 end
 
 local function playersFmt(p,m) return string.format("%d/%d", p or 0, m or 0) end
-
--- === ПУЛ КОМПОНЕНТОВ + ОЧЕРЕДЬ СОЗДАНИЙ (анти-лаг) ===
-local PENDING_CREATE = {}  -- массив функций, которые создают 1 элемент
-local MAX_CREATES_PER_TICK = 6
-
-RunService.Heartbeat:Connect(function()
-    local budget = MAX_CREATES_PER_TICK
-    while budget > 0 and #PENDING_CREATE > 0 do
-        local f = table.remove(PENDING_CREATE, 1)
-        pcall(f)
-        budget -= 1
-    end
-end)
-
 local function ensureItem(jobId, data)
-    local have = Entries[jobId]
-    if have and have.frame then return have.frame end
+    local e=Entries[jobId]; if e and e.frame then return e.frame end
+    local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel; item.Parent=scroll; roundify(item,10); stroke(item,COLORS.purpleSoft,1,0.35); padding(item,12,6,12,6)
+    local nameLbl=mkLabel(item, string.upper(data.name), 18, "bold", COLORS.textPrimary); nameLbl.Size=UDim2.new(0.44,-10,1,0)
+    local moneyLbl=mkLabel(item, string.upper(data.moneyStr or ""), 17, "medium", Color3.fromRGB(130,255,130)); moneyLbl.AnchorPoint=Vector2.new(0,0.5); moneyLbl.Position=UDim2.new(0.46,0,0.5,0); moneyLbl.Size=UDim2.new(0.22,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Left
+    local playersLbl=mkLabel(item, playersFmt(data.curPlayers,data.maxPlayers), 16, "medium", COLORS.textWeak); playersLbl.AnchorPoint=Vector2.new(0,0.5); playersLbl.Position=UDim2.new(0.69,0,0.5,0); playersLbl.Size=UDim2.new(0.12,0,1,0); playersLbl.TextXAlignment=Enum.TextXAlignment.Left
+    local joinBtn=Instance.new("TextButton"); joinBtn.Text="JOIN"; setFont(joinBtn,"bold"); joinBtn.TextSize=18; joinBtn.TextColor3=Color3.fromRGB(22,22,22); joinBtn.AutoButtonColor=true; joinBtn.BackgroundColor3=COLORS.joinBtn; joinBtn.Size=UDim2.new(0,84,0,36); joinBtn.AnchorPoint=Vector2.new(1,0.5); joinBtn.Position=UDim2.new(1,-8,0.5,0); roundify(joinBtn,10); stroke(joinBtn,Color3.fromRGB(0,0,0),1,0.7); joinBtn.Parent=item
 
-    -- лениво создаём через очередь (не сразу, чтобы не лагать)
-    table.insert(PENDING_CREATE, function()
-        if Entries[jobId] and Entries[jobId].frame then return end
+    -- === Надёжный JOIN RETRY + ЛОГИ ===
+    joinBtn.MouseButton1Click:Connect(function()
+        local maxRetries = tonumber(jrBox.Text) or State.JoinRetry or 0
+        local attempts   = 0
+        local active     = true
 
-        local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel; item.Parent=scroll; roundify(item,10); stroke(item,COLORS.purpleSoft,1,0.35); padding(item,12,6,12,6)
-        local nameLbl=mkLabel(item, string.upper(data.name), 18, "bold", COLORS.textPrimary); nameLbl.Size=UDim2.new(0.44,-10,1,0)
-        local moneyLbl=mkLabel(item, string.upper(data.moneyStr or ""), 17, "medium", Color3.fromRGB(130,255,130)); moneyLbl.AnchorPoint=Vector2.new(0,0.5); moneyLbl.Position=UDim2.new(0.46,0,0.5,0); moneyLbl.Size=UDim2.new(0.22,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Left
-        local playersLbl=mkLabel(item, playersFmt(data.curPlayers,data.maxPlayers), 16, "medium", COLORS.textWeak); playersLbl.AnchorPoint=Vector2.new(0,0.5); playersLbl.Position=UDim2.new(0.69,0,0.5,0); playersLbl.Size=UDim2.new(0.12,0,1,0); playersLbl.TextXAlignment=Enum.TextXAlignment.Left
-        local joinBtn=Instance.new("TextButton"); joinBtn.Text="JOIN"; setFont(joinBtn,"bold"); joinBtn.TextSize=18; joinBtn.TextColor3=Color3.fromRGB(22,22,22); joinBtn.AutoButtonColor=true; joinBtn.BackgroundColor3=COLORS.joinBtn; joinBtn.Size=UDim2.new(0,84,0,36); joinBtn.AnchorPoint=Vector2.new(1,0.5); joinBtn.Position=UDim2.new(1,-8,0.5,0); roundify(joinBtn,10); stroke(joinBtn,Color3.fromRGB(0,0,0),1,0.7); joinBtn.Parent=item
+        local function resName(res) return (typeof(res)=="EnumItem" and res.Name) or tostring(res) end
+        local function backoff(n) return math.min(2.0, 0.25 * (2 ^ math.max(n-1,0))) end
 
-        -- НАДЁЖНЫЙ JOIN RETRY (две шины + watchdog)
-        joinBtn.MouseButton1Click:Connect(function()
-            local maxRetries = tonumber(jrBox.Text) or State.JoinRetry or 0
-            local tries = 0
-            local active = true
+        -- Ретраим эти коды (ключевой — GameFull)
+        local retryable = {
+            [Enum.TeleportResult.GameFull] = true,
+            [Enum.TeleportResult.Failure]  = true,
+            [Enum.TeleportResult.Timeout]  = true,
+            [Enum.TeleportResult.ServiceUnavailable] = true,
+        }
 
-            joinBtn.AutoButtonColor = false
-            joinBtn.Active = false
-            joinBtn.Text = "JOIN…"
+        joinBtn.AutoButtonColor = false
+        joinBtn.Active = false
+        joinBtn.Text = "JOIN…"
 
-            -- локальные соединения, которые потом чистим
-            local c_initFailed, c_teleState
-            local function cleanup(finalText)
+        local connInitFail, connTeleState, connTeleOnce
+
+        local function cleanup(finalText)
+            if not active then return end
+            active = false
+            if connInitFail then connInitFail:Disconnect() end
+            if connTeleState then connTeleState:Disconnect() end
+            if connTeleOnce then connTeleOnce:Disconnect() end
+            joinBtn.Text = finalText or "JOIN"
+            task.delay(0.25, function()
+                if joinBtn then joinBtn.AutoButtonColor = true; joinBtn.Active = true end
+            end)
+        end
+
+        local function attemptTeleport()
+            if not active then return end
+            attempts += 1
+            local label = (attempts==1) and "JOIN…" or string.format("RETRY %d/%d", attempts-1, maxRetries)
+            joinBtn.Text = label
+
+            -- ЛОГ: попытка
+            print(string.format("[FloppaAJ] join try %d/%d -> TeleportToPlaceInstance(%d, %s)",
+                attempts-1, maxRetries, TARGET_PLACE_ID, tostring(jobId)))
+
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, Players.LocalPlayer)
+            end)
+
+            -- Вотчдог: если 6 сек тишина — повторим
+            local thisAttempt = attempts
+            task.delay(6.0, function()
                 if not active then return end
-                active = false
-                if c_initFailed then c_initFailed:Disconnect() end
-                if c_teleState then c_teleState:Disconnect() end
-                joinBtn.Text = finalText or "JOIN"
-                task.delay(0.3,function()
-                    if joinBtn then joinBtn.AutoButtonColor = true; joinBtn.Active = true end
-                end)
-            end
-
-            local function delayFor(n) return math.min(2.0, 0.12 * (2 ^ (n-1))) end
-            local function doAttempt()
-                if not active then return end
-                tries += 1
-                joinBtn.Text = (tries==1) and "JOIN…" or string.format("RETRY %d/%d", tries-1, maxRetries)
-                pcall(function()
-                    TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, Players.LocalPlayer)
-                end)
-                -- отдельный сторожок на попытку: если нет ни успеха, ни фейла X секунд — повторим
-                local myTry = tries
-                task.delay(5.0, function()
-                    if active and myTry == tries then
-                        if tries-1 >= maxRetries then
-                            cleanup("TIMEOUT")
-                        else
-                            task.delay(delayFor(tries), doAttempt)
-                        end
-                    end
-                end)
-            end
-
-            -- 1) фейлы инициализации телепорта (не у всех экзекуторов стабильно, но слушаем)
-            c_initFailed = TeleportService.TeleportInitFailed:Connect(function(player, result, placeId, options)
-                if not active or player ~= Players.LocalPlayer then return end
-                -- иногда placeId может быть 0/nil — не фильтруем строго
-                local retryable = {
-                    [Enum.TeleportResult.Failure] = true,
-                    [Enum.TeleportResult.GameFull] = true,
-                    [Enum.TeleportResult.GameEnded] = true,
-                    [Enum.TeleportResult.Unauthorized] = true,
-                    [Enum.TeleportResult.ServiceUnavailable] = true,
-                    [Enum.TeleportResult.InvalidTeleportConfiguration] = true,
-                    [Enum.TeleportResult.Timeout] = true,
-                }
-                if retryable[result] then
-                    if (tries-1) >= maxRetries then
-                        cleanup("GAVE UP")
+                if attempts == thisAttempt then
+                    if (attempts-1) >= maxRetries then
+                        warn("[FloppaAJ] join timeout, retries exhausted")
+                        cleanup("TIMEOUT")
                     else
-                        task.delay(delayFor(tries+1), doAttempt)
+                        warn(string.format("[FloppaAJ] join watchdog retry %d/%d", attempts, maxRetries))
+                        task.delay(backoff(attempts), attemptTeleport)
                     end
+                end
+            end)
+        end
+
+        -- 1) Основной фейл (в консоли у тебя: Requested experience is full (GameFull))
+        connInitFail = TeleportService.TeleportInitFailed:Connect(function(player, result, placeId, options)
+            if not active or player ~= Players.LocalPlayer then return end
+            warn(string.format("[FloppaAJ] TeleportInitFailed: %s (placeId=%s) on try %d/%d",
+                resName(result), tostring(placeId), attempts-1, maxRetries))
+
+            if retryable[result] then
+                if (attempts-1) >= maxRetries then
+                    cleanup("GAVE UP")
                 else
-                    cleanup("FAILED")
+                    task.delay(backoff(attempts+1), attemptTeleport)
                 end
-            end)
-
-            -- 2) состояние телепорта у локального игрока (надёжный фолбэк)
-            c_teleState = Players.LocalPlayer.OnTeleport:Connect(function(state)
-                if not active then return end
-                if state == Enum.TeleportState.Started or state == Enum.TeleportState.WaitingForServer or state == Enum.TeleportState.Connecting then
-                    -- нормальные состояния — ждём перехода, ничего не делаем
-                elseif state == Enum.TeleportState.Failed then
-                    if (tries-1) >= maxRetries then
-                        cleanup("FAILED")
-                    else
-                        task.delay(delayFor(tries+1), doAttempt)
-                    end
-                end
-            end)
-
-            -- Если всё-таки реально уходим — закроем аккуратно
-            Players.LocalPlayer.OnTeleport:Once(function(state)
-                if state == Enum.TeleportState.Started then
-                    cleanup("OK")
-                end
-            end)
-
-            -- Первая попытка
-            doAttempt()
+            else
+                cleanup("FAILED")
+            end
         end)
 
-        Entries[jobId]={data=data, frame=item, firstSeen=os.clock(), lastSeen=os.clock(), refs={nameLbl=nameLbl, moneyLbl=moneyLbl, playersLbl=playersLbl}}
+        -- 2) Доп. шина состояний: ловим общий Failed у локального игрока
+        connTeleState = Players.LocalPlayer.OnTeleport:Connect(function(state)
+            if not active then return end
+            if state == Enum.TeleportState.Failed then
+                warn(string.format("[FloppaAJ] OnTeleport state=Failed on try %d/%d", attempts-1, maxRetries))
+                if (attempts-1) >= maxRetries then
+                    cleanup("FAILED")
+                else
+                    task.delay(backoff(attempts+1), attemptTeleport)
+                end
+            end
+        end)
+
+        -- 3) Успех — телепорт начал стартовать
+        connTeleOnce = Players.LocalPlayer.OnTeleport:Once(function(state)
+            if state == Enum.TeleportState.Started then
+                print(string.format("[FloppaAJ] teleport started on try %d/%d — success", attempts-1, maxRetries))
+                cleanup("OK")
+            end
+        end)
+
+        -- Стартуем первую попытку
+        attemptTeleport()
     end)
 
-    return true -- пометили к созданию
+    Entries[jobId]={data=data, frame=item, firstSeen=os.clock(), lastSeen=os.clock(), refs={nameLbl=nameLbl, moneyLbl=moneyLbl, playersLbl=playersLbl}}
+    return item
 end
 
 local function updateItem(jobId, data)
     local e=Entries[jobId]
-    if not e then
-        local queued = ensureItem(jobId, data)
-        if queued then table.insert(Order, jobId) end
+    if not e then ensureItem(jobId, data); table.insert(Order, jobId); e=Entries[jobId]
     else
         if data.mps > (e.data.mps or 0) then e.data = data end
         e.lastSeen = os.clock()
-        local r=e.refs
-        if r then
-            r.nameLbl.Text=string.upper(e.data.name)
-            r.moneyLbl.Text=string.upper(e.data.moneyStr or "")
-            r.playersLbl.Text=playersFmt(e.data.curPlayers,e.data.maxPlayers)
-        end
     end
+    local r=e.refs; if r then r.nameLbl.Text=string.upper(e.data.name); r.moneyLbl.Text=string.upper(e.data.moneyStr or ""); r.playersLbl.Text=playersFmt(e.data.curPlayers,e.data.maxPlayers) end
 end
-
 local function removeItem(jobId)
     local e=Entries[jobId]; if not e then return end
     if e.frame then pcall(function() e.frame:Destroy() end) end
     Entries[jobId]=nil; for i=#Order,1,-1 do if Order[i]==jobId then table.remove(Order,i) break end end
 end
-
--- троттлинг перерисовки
 local function resortPaint()
     table.sort(Order,function(a,b) local ea,eb=Entries[a],Entries[b]; if not ea or not eb then return (a or "")<(b or "") end; if ea.data.mps~=eb.data.mps then return ea.data.mps>eb.data.mps end; return ea.lastSeen>eb.lastSeen end)
     local shown=0
@@ -361,16 +329,9 @@ local function resortPaint()
     statsLbl.Text=string.format("shown: %d • min: %dM/s", shown, minM)
     task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
 end
-local lastPaint = 0
-local function requestPaint(force)
-    local now = os.clock()
-    if force or (now - lastPaint) >= 0.40 then
-        lastPaint = now
-        task.defer(resortPaint)
-    end
-end
 
 -- ==== Pull loop (async, incremental) ====
+local multMap={K=1e3,M=1e6,B=1e9,T=1e12}
 local function pickBestByServer(items)
     local bestById={}
     for _,it in ipairs(items) do
@@ -407,21 +368,20 @@ task.spawn(function()
                 local best = pickBestByServer(data.items)
 
                 if not firstSnapshotDone then
-                    for _, d in pairs(best) do
-                        local h = hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})
-                        SeenHashes[h] = os.clock()
-                    end
+                    -- первый снимок: только запоминаем, ничего не рисуем
+                    for _,d in pairs(best) do SeenHashes[hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})]=true end
                     firstSnapshotDone = true
                 else
+                    -- инкрементально добавляем ТОЛЬКО новые хэши
                     local anyChanged=false
                     for _,d in pairs(best) do
                         local h = hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})
                         if not SeenHashes[h] then
-                            SeenHashes[h]=os.clock()
+                            SeenHashes[h]=true
                             updateItem(d.jobId, d)
                             anyChanged=true
                         else
-                            SeenHashes[h]=os.clock()
+                            -- если запись уже «видели», просто обновим цифры онлайна/таймштамп
                             if Entries[d.jobId] then
                                 Entries[d.jobId].data.curPlayers=d.curPlayers
                                 Entries[d.jobId].data.maxPlayers=d.maxPlayers
@@ -429,13 +389,13 @@ task.spawn(function()
                             end
                         end
                     end
+                    -- чистим протухшие
                     for id,e in pairs(Entries) do if (os.clock()-e.lastSeen) > ENTRY_TTL_SEC then removeItem(id) end end
-                    purgeSeenHashes(SEEN_HASH_MAX_AGE)
-                    if anyChanged then requestPaint(true) else requestPaint(false) end
+                    if anyChanged then task.defer(resortPaint) else task.defer(resortPaint) end
                 end
             end
         end
-        task.wait(0.05)
+        task.wait(0.05) -- мягкий цикл
     end
 end)
 
