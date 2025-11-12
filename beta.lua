@@ -1,36 +1,41 @@
---[[ FLOPPA AUTO JOINER v6.4 — Patched
-     • Основные изменения: троттлинг перерисовки, условный ресорт, батч-апдейты,
-       адаптивный пуллинг, уменьшение твинов, безопасный CanvasSize, Top-N отображение
-     • Хоткей GUI = T
+--[[ Floppa Auto Joiner — Minimal UI (headless list) + Settings + Auto-Inject
+     Goals:
+       • Tiny menu (~260x180), rounded corners
+       • Start/Stop Auto Join button
+       • Min profit per second filter (in MILLIONS)
+       • Settings persistence (JSON file)
+       • Auto re-inject on teleport using provided GitHub URL
+       • No heavy list rendering → no micro-freezes
+       • Pulls site data (JSON or line format) → filters → tries to join
+         If server is full (Teleport fails), retry up to 65 times at 10/s (every 0.1s), then skip
 ]]
 
 ---------------- USER/API SETTINGS ----------------
-local AUTO_INJECT_URL   = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
-local FIXED_HOTKEY      = Enum.KeyCode.T
-local SETTINGS_PATH     = "floppa_aj_settings.json"
-
 local SERVER_BASE       = "https://server-eta-two-29.vercel.app"
 local API_KEY           = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
 
+-- Game target
 local TARGET_PLACE_ID   = 109983668079237
-local PULL_INTERVAL_SEC = 2.5         -- базовый интервал опроса (адаптивный ниже)
-local PULL_INTERVAL_MAX = 5.0         -- верхняя граница при тишине
-local PULL_INTERVAL_MIN = 1.8         -- нижняя граница при активных изменениях
-local ENTRY_TTL_SEC     = 180.0       -- авто-удаление старше 3 минут
-local FRESH_AGE_SEC     = 12.0        -- подсветка «новых»
-local DEBUG             = false
-local RENDER_LIMIT      = 80          -- Top-N рендер. Остальные скрыты (виртуализация лайтовая)
+
+-- Polling / retries
+local PULL_INTERVAL_SEC = 2.5
+local JOIN_RETRY_COUNT  = 65
+local JOIN_RETRY_RATE   = 10       -- attempts per second
+
+-- Settings & Auto-Inject
+local SETTINGS_PATH     = "floppa_mini_aj_settings.json"
+local AUTO_INJECT_URL   = "https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/beta.lua"
 
 ---------------------------------------------------
 
 local Players          = game:GetService("Players")
 local UIS              = game:GetService("UserInputService")
-local TweenService     = game:GetService("TweenService")
-local Lighting         = game:GetService("Lighting")
 local HttpService      = game:GetService("HttpService")
 local TeleportService  = game:GetService("TeleportService")
 
--- ==== FS helpers (config) ====
+print("[MiniAJ] Booting")
+
+-- ========= FS helpers =========
 local function hasFS() return typeof(writefile)=="function" and typeof(readfile)=="function" and typeof(isfile)=="function" end
 local function saveJSON(path, t)
     if not hasFS() then return false end
@@ -45,8 +50,120 @@ local function loadJSON(path)
     return tbl
 end
 
--- ==== Singleton cleanup ====
-local function guiRoot()
+-- ========= Auto-Inject (queue on teleport) =========
+local function pickQueue()
+    local q=nil
+    pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end)
+    if not q and type(queue_on_teleport)=="function" then q=queue_on_teleport end
+    if not q and type(queueteleport)=="function" then q=queueteleport end
+    pcall(function() if not q and type(fluxus)=="table" and type(fluxus.queue_on_teleport)=="function" then q=fluxus.queue_on_teleport end end)
+    return q
+end
+
+local function makeBootstrap()
+    -- Small bootstrap that fetches and runs the latest script from AUTO_INJECT_URL on the next server
+    local src = [[
+        task.spawn(function()
+            if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end
+            local function g(u)
+                for i=1,3 do
+                    local ok,r = pcall(function() return game:HttpGet(u) end)
+                    if ok and type(r)=='string' and #r>0 then return r end
+                    task.wait(1)
+                end
+            end
+            local s = g(']]..AUTO_INJECT_URL..[[')
+            if s then local f=loadstring(s); if f then pcall(f) end end
+        end)
+    ]]
+    return src
+end
+
+local function queueReinject()
+    local q = pickQueue()
+    if q then q(makeBootstrap()) end
+end
+
+-- Always queue now and also when teleport starts
+queueReinject()
+Players.LocalPlayer.OnTeleport:Connect(function(st)
+    if st == Enum.TeleportState.Started then
+        queueReinject()
+    end
+end)
+
+-- ========= Helpers =========
+local function parseMoneyStr(s)
+    s = tostring(s or ""):gsub(","," "):gsub(" ","") -- remove commas/spaces
+    s = s:upper()
+    local num, unit = s:match("%$%s*([%d%.]+)%s*([KMBT]?)%s*/%s*[Ss]")
+    if not num then num, unit = s:match("%$%s*([%d%.]+)%s*([KMBT]?)") end
+    local mult = {K=1e3, M=1e6, B=1e9, T=1e12}
+    if not num then return 0 end
+    return math.floor((tonumber(num) or 0) * (mult[unit or ""] or 1) + 0.5)
+end
+
+local function http_get(url)
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if not ok or type(body) ~= "string" or #body == 0 then return false end
+    return true, body
+end
+
+local function parse_lines_payload(body)
+    local items = {}
+    for line in tostring(body or ""):gmatch("[^
+]+") do
+        local a,b,c,d = line:match("^%s*(.-)%s*|%s*(.-)%s*|%s*(.-)%s*|%s*(.-)%s*$")
+        if a and b and c and d then
+            local name = tostring(a)
+            local money = tostring(b):gsub("%*","")
+            local players = tostring(c):gsub("%*","")
+            local id = tostring(d)
+            local cur,max = players:match("(%d+)%s*/%s*(%d+)")
+            cur = tonumber(cur or 0) or 0
+            max = tonumber(max or 0) or 0
+            table.insert(items, { id=id, job_id=id, name=name, money=money, money_per_second=money, players=string.format("%d/%d",cur,max) })
+        end
+    end
+    return items
+end
+
+local function fetch_items(limit)
+    local url = string.format("%s/api/jobs?limit=%d&_cb=%d&key=%s", SERVER_BASE, limit or 200, math.random(10^6,10^7), API_KEY)
+    local ok, body = http_get(url)
+    if not ok then return false end
+    local okJ, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if okJ and type(data) == "table" and type(data.items) == "table" then
+        return true, data.items
+    end
+    local items = parse_lines_payload(body)
+    if #items > 0 then return true, items end
+    return false
+end
+
+local function pick_best_by_server(items)
+    local best = {}
+    for i = 1, #items do
+        local it = items[i]
+        local id = tostring(it.id or it.job_id or "")
+        local name = tostring(it.name or "")
+        local moneyStr = tostring(it.money_per_second or it.money or "")
+        local players  = tostring(it.players or "")
+        if id ~= "" and name ~= "" and moneyStr ~= "" and players ~= "" then
+            local cur,max = players:match("(%d+)%s*/%s*(%d+)")
+            cur = tonumber(cur or 0) or 0
+            max = tonumber(max or 0) or 0
+            local mps = parseMoneyStr(moneyStr)
+            local obj = { jobId=id, name=name, moneyStr=moneyStr, mps=mps, curPlayers=cur, maxPlayers=max }
+            local prev = best[id]
+            if (not prev) or (obj.mps > prev.mps) then best[id] = obj end
+        end
+    end
+    return best
+end
+
+-- ========= Minimal UI =========
+local function uiRoot()
     local okH, hui = pcall(function() return gethui and gethui() end)
     if okH and hui then return hui end
     local okC, core = pcall(function() return game:GetService("CoreGui") end)
@@ -54,380 +171,148 @@ local function guiRoot()
     return Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui") or nil
 end
 
--- убираем старый GUI
- do
-    local root = guiRoot()
-    if root then local old = root:FindFirstChild("FloppaAutoJoinerGui"); if old then pcall(function() old:Destroy() end) end end
-    local G=(getgenv and getgenv()) or _G; G.__FLOPPA_UI_ACTIVE=true
+-- remove old
+local _root = uiRoot()
+if _root then local old = _root:FindFirstChild("MiniAJGui"); if old then pcall(function() old:Destroy() end) end end
+
+local COLORS = {
+    bg = Color3.fromRGB(20,22,26),
+    panel = Color3.fromRGB(28,30,36),
+    text = Color3.fromRGB(235,235,245),
+    weak = Color3.fromRGB(170,175,190),
+    btn  = Color3.fromRGB(67,232,113),
+}
+
+local gui = Instance.new("ScreenGui"); gui.Name = "MiniAJGui"; gui.IgnoreGuiInset = true; gui.ResetOnSpawn=false; gui.DisplayOrder=9e5; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.Parent = _root
+local frame = Instance.new("Frame"); frame.Name="Panel"; frame.Size = UDim2.new(0, 260, 0, 190); frame.Position = UDim2.new(0, 20, 0, 120); frame.BackgroundColor3 = COLORS.panel; frame.BackgroundTransparency = 0.08; frame.Parent = gui
+local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 14); c.Parent = frame
+local stroke = Instance.new("UIStroke"); stroke.Color = Color3.fromRGB(80,80,110); stroke.Thickness=1; stroke.Transparency=0.35; stroke.ApplyStrokeMode=Enum.ApplyStrokeMode.Border; stroke.Parent=frame
+local pad = Instance.new("UIPadding"); pad.PaddingLeft=UDim.new(0,10); pad.PaddingRight=UDim.new(0,10); pad.PaddingTop=UDim.new(0,10); pad.PaddingBottom=UDim2.new(0,10); pad.Parent=frame
+
+local function label(parent,text,size,bold)
+    local l = Instance.new("TextLabel"); l.BackgroundTransparency=1; l.Text = text; l.TextColor3 = COLORS.text; l.TextSize = size or 16; l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham; l.Parent = parent; return l
 end
 
--- ==== Persisted defaults ====
-local State = { AutoJoin=false, AutoInject=false, IgnoreEnabled=false, JoinRetry=50, MinMS=1, IgnoreNames={} }
- do
-    local cfg=loadJSON(SETTINGS_PATH)
-    if cfg then
-        State.AutoJoin      = cfg.AutoJoin and true or false
-        State.AutoInject    = cfg.AutoInject and true or false
-        State.IgnoreEnabled = cfg.IgnoreEnabled and true or false
-        State.JoinRetry     = tonumber(cfg.JoinRetry) or State.JoinRetry
-        State.MinMS         = tonumber(cfg.MinMS) or State.MinMS
-        State.IgnoreNames   = type(cfg.IgnoreNames)=="table" and cfg.IgnoreNames or State.IgnoreNames
-    end
+local title = label(frame, "FLOPPA MINI AJ", 18, true); title.Size = UDim2.new(1,0,0,22)
+
+local minRow = Instance.new("Frame"); minRow.Size = UDim2.new(1,0,0,56); minRow.Position = UDim2.new(0,0,0,28); minRow.BackgroundTransparency=1; minRow.Parent=frame
+local minLbl = label(minRow, "Min profit (M/s):", 14, false); minLbl.Position = UDim2.new(0,0,0,0); minLbl.Size = UDim2.new(1,0,0,20); minLbl.TextColor3 = COLORS.weak
+local minBox = Instance.new("TextBox"); minBox.PlaceholderText = "e.g. 5"; minBox.Text = "5"; minBox.ClearTextOnFocus=false; minBox.TextSize=16; minBox.TextColor3=COLORS.text; minBox.PlaceholderColor3=COLORS.weak; minBox.BackgroundColor3=COLORS.bg; minBox.BackgroundTransparency=0.1; minBox.Size=UDim2.new(1,0,0,28); minBox.Position=UDim2.new(0,0,0,24); minBox.Parent=minRow
+local cc = Instance.new("UICorner"); cc.CornerRadius=UDim.new(0,8); cc.Parent=minBox
+minBox:GetPropertyChangedSignal("Text"):Connect(function() minBox.Text = minBox.Text:gsub("[^%d]","") end)
+
+local startBtn = Instance.new("TextButton"); startBtn.Text = "START AUTO JOIN"; startBtn.TextColor3 = Color3.fromRGB(20,20,20); startBtn.TextSize=16; startBtn.Font=Enum.Font.GothamBold; startBtn.AutoButtonColor=true; startBtn.BackgroundColor3=COLORS.btn; startBtn.Size=UDim2.new(1,0,0,32); startBtn.Position=UDim2.new(0,0,0,92); startBtn.Parent=frame
+local bc = Instance.new("UICorner"); bc.CornerRadius=UDim.new(0,10); bc.Parent=startBtn
+
+local status = label(frame, "status: idle", 14, false); status.Position = UDim2.new(0,0,0,134); status.Size = UDim2.new(1,0,0,20); status.TextColor3 = COLORS.weak
+
+-- ========= Settings load/apply =========
+local Settings = { MinM = 5, AutoStart = false }
+local cfg = loadJSON(SETTINGS_PATH)
+if cfg then
+    if tonumber(cfg.MinM) then Settings.MinM = tonumber(cfg.MinM) end
+    if type(cfg.AutoStart)=="boolean" then Settings.AutoStart = cfg.AutoStart end
 end
+minBox.Text = tostring(Settings.MinM)
+if Settings.AutoStart then startBtn.Text = "STOP" end
 
--- ==== UI mini lib & style ====
-local COLORS={purpleDeep=Color3.fromRGB(96,63,196), purple=Color3.fromRGB(134,102,255), purpleSoft=Color3.fromRGB(160,135,255),
-    surface=Color3.fromRGB(18,18,22), surface2=Color3.fromRGB(26,26,32), textPrimary=Color3.fromRGB(238,238,245),
-    textWeak=Color3.fromRGB(190,190,200), on=Color3.fromRGB(64,222,125), off=Color3.fromRGB(120,120,130),
-    joinBtn=Color3.fromRGB(67,232,113), stroke=Color3.fromRGB(70,60,140)}
-local ALPHA={panel=0.12, card=0.18}
-local function roundify(o,px) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,px or 10); c.Parent=o end
-local function stroke(o,col,th,tr) local s=Instance.new("UIStroke"); s.Color=col or COLORS.stroke; s.Thickness=th or 1; s.Transparency=tr or 0.25; s.ApplyStrokeMode=Enum.ApplyStrokeMode.Border; s.Parent=o end
-local function padding(o,l,t,r,b) local p=Instance.new("UIPadding"); p.PaddingLeft=UDim.new(0,l or 0); p.PaddingTop=UDim.new(0,t or 0); p.PaddingRight=UDim.new(0,r or 0); p.PaddingBottom=UDim.new(0,b or 0); p.Parent=o end
-local function setFont(x,w) local ok=pcall(function() x.Font=(w=="bold" and Enum.Font.GothamBold) or (w=="medium" and Enum.Font.GothamMedium) or Enum.Font.Gotham end); if not ok then x.Font=(w=="bold" and Enum.Font.SourceSansBold) or Enum.Font.SourceSans end end
-local function mkLabel(p,txt,size,w,col) local l=Instance.new("TextLabel"); l.BackgroundTransparency=1; l.Text=txt; l.TextSize=size or 18; l.TextColor3=col or COLORS.textPrimary; l.TextXAlignment=Enum.TextXAlignment.Left; setFont(l,w); l.Parent=p; return l end
-local function mkHeader(p,txt) local h=Instance.new("Frame"); h.Size=UDim2.new(1,0,0,38); h.BackgroundColor3=COLORS.surface2; h.BackgroundTransparency=ALPHA.card; h.Parent=p; roundify(h,8); stroke(h); padding(h,12,6,12,6); local g=Instance.new("UIGradient"); g.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,COLORS.purpleDeep),ColorSequenceKeypoint.new(1,COLORS.purple)}; g.Transparency=NumberSequence.new{NumberSequenceKeypoint.new(0,0.4),NumberSequenceKeypoint.new(1,0.4)}; g.Rotation=90; g.Parent=h; mkLabel(h,txt,18,"bold",COLORS.textPrimary).Size=UDim2.new(1,0,1,0); return h end
-local function mkToggle(p,txt,def)
-    local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,44); row.BackgroundColor3=COLORS.surface2; row.BackgroundTransparency=ALPHA.card; row.Parent=p; roundify(row,10); stroke(row); padding(row,12,0,12,0)
-    mkLabel(row,txt,17,"medium",COLORS.textPrimary).Size=UDim2.new(1,-80,1,0)
-    local sw=Instance.new("TextButton"); sw.Text=""; sw.AutoButtonColor=false; sw.BackgroundColor3=Color3.fromRGB(40,40,48); sw.BackgroundTransparency=0.2; sw.Size=UDim2.new(0,62,0,28); sw.AnchorPoint=Vector2.new(1,0.5); sw.Position=UDim2.new(1,-6,0.5,0); sw.Parent=row; roundify(sw,14); stroke(sw,COLORS.purpleSoft,1,0.35)
-    local dot=Instance.new("Frame"); dot.Size=UDim2.new(0,24,0,24); dot.Position=UDim2.new(0,2,0.5,-12); dot.BackgroundColor3=COLORS.off; dot.Parent=sw; roundify(dot,12)
-    local state={Value=def and true or false, Changed=nil}
-    local function apply(v,inst)
-        state.Value=v
-        local pos=v and UDim2.new(1,-26,0.5,-12) or UDim2.new(0,2,0.5,-12)
-        local col=v and COLORS.on or COLORS.off
-        if inst then dot.Position=pos; dot.BackgroundColor3=col; sw.BackgroundColor3=v and Color3.fromRGB(55,58,74) or Color3.fromRGB(40,40,48)
-        else dot.Position=pos; dot.BackgroundColor3=col; sw.BackgroundColor3=v and Color3.fromRGB(55,58,74) or Color3.fromRGB(40,40,48) end -- без твинов
-        if state.Changed then task.defer(function() pcall(state.Changed,state.Value) end) end
-    end
-    apply(state.Value,true)
-    sw.MouseButton1Click:Connect(function() apply(not state.Value,false) end)
-    return row, state, apply
-end
-local function mkStackInput(p,title,ph,def,isNum)
-    local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,70); row.BackgroundColor3=COLORS.surface2; row.BackgroundTransparency=ALPHA.card; row.Parent=p; roundify(row,10); stroke(row); padding(row,12,8,12,12)
-    mkLabel(row,title,16,"medium",COLORS.textPrimary).Size=UDim2.new(1,0,0,18)
-    local box=Instance.new("TextBox"); box.PlaceholderText=ph or ""; box.Text=def or ""; box.ClearTextOnFocus=false; box.TextSize=17; box.TextColor3=COLORS.textPrimary; box.PlaceholderColor3=COLORS.textWeak; box.BackgroundColor3=Color3.fromRGB(32,32,38); box.BackgroundTransparency=0.15; box.Size=UDim2.new(1,0,0,30); box.Position=UDim2.new(0,0,0,30); roundify(box,8); stroke(box,COLORS.purpleSoft,1,0.35); box.Parent=row
-    if isNum then box:GetPropertyChangedSignal("Text"):Connect(function() box.Text=box.Text:gsub("[^%d]","") end) end
-    local state={}
-    box.FocusLost:Connect(function()
-        state.Value=isNum and (tonumber(box.Text) or 0) or box.Text
-    end)
-    return row, state, box
-end
-
--- ==== Blur ====
-local blur=Lighting:FindFirstChild("FloppaLightBlur") or Instance.new("BlurEffect"); blur.Name="FloppaLightBlur"; blur.Size=0; blur.Enabled=false; blur.Parent=Lighting
-local function setBlur(e) if e then blur.Enabled=true; blur.Size=4 else blur.Size=0; task.delay(0.02,function() blur.Enabled=false end) end end
-
--- ==== Root GUI ====
-local root=guiRoot() or Players.LocalPlayer:WaitForChild("PlayerGui")
-local gui=Instance.new("ScreenGui"); gui.Name="FloppaAutoJoinerGui"; gui.IgnoreGuiInset=true; gui.ResetOnSpawn=false; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; gui.DisplayOrder=1e6; gui.Parent=root
-local main=Instance.new("Frame"); main.Size=UDim2.new(0,980,0,560); main.Position=UDim2.new(0.5,-490,0.5,-280); main.BackgroundColor3=COLORS.surface; main.BackgroundTransparency=ALPHA.panel; main.Parent=gui; roundify(main,14); stroke(main,COLORS.purpleSoft,1.5,0.35); padding(main,10,10,10,10)
-
-local header=Instance.new("Frame"); header.Size=UDim2.new(1,0,0,48); header.BackgroundColor3=COLORS.surface2; header.BackgroundTransparency=ALPHA.card; header.Parent=main; roundify(header,10); stroke(header); padding(header,14,6,14,6)
-mkLabel(header,"FLOPPA AUTO JOINER",20,"bold",COLORS.textPrimary).Size=UDim2.new(0.6,0,1,0)
-local hotkeyInfo=mkLabel(header,"OPEN GUI KEY:  T",16,"medium",COLORS.textWeak); hotkeyInfo.AnchorPoint=Vector2.new(1,0.5); hotkeyInfo.Position=UDim2.new(1,-14,0.5,0); hotkeyInfo.Size=UDim2.new(0.35,0,1,0); hotkeyInfo.TextXAlignment=Enum.TextXAlignment.Right
-local refreshBtn=Instance.new("TextButton"); refreshBtn.Text="Refresh"; setFont(refreshBtn,"medium"); refreshBtn.TextSize=14; refreshBtn.TextColor3=COLORS.textPrimary; refreshBtn.BackgroundColor3=COLORS.surface; refreshBtn.BackgroundTransparency=0.1; refreshBtn.Size=UDim2.new(0,80,0,28); refreshBtn.AnchorPoint=Vector2.new(1,0.5); refreshBtn.Position=UDim2.new(1,-180,0.5,0); refreshBtn.AutoButtonColor=true; roundify(refreshBtn,8); stroke(refreshBtn,COLORS.purpleSoft,1,0.4); refreshBtn.Parent=header
-
-local left=Instance.new("ScrollingFrame"); left.Size=UDim2.new(0,300,1,-58); left.Position=UDim2.new(0,0,0,58); left.BackgroundTransparency=1; left.ScrollBarThickness=6; left.ScrollingDirection=Enum.ScrollingDirection.Y; left.CanvasSize=UDim2.new(0,0,0,0); left.Parent=main
-local leftPad=padding(left,0,0,0,10); local leftList=Instance.new("UIListLayout"); leftList.Padding=UDim.new(0,10); leftList.SortOrder=Enum.SortOrder.LayoutOrder; leftList.Parent=left
-local function updLeftCanvas() left.CanvasSize=UDim2.new(0,0,0,leftList.AbsoluteContentSize.Y+leftPad.PaddingBottom.Offset) end; leftList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updLeftCanvas)
-
-local right=Instance.new("Frame"); right.Size=UDim2.new(1,-320,1,-58); right.Position=UDim2.new(0,320,0,58); right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card; right.Parent=main; roundify(right,12); stroke(right); padding(right,12,12,12,12)
-local statsLbl=mkLabel(right,"shown: 0 • min: 0M/s",13,"medium",COLORS.textWeak); statsLbl.AnchorPoint=Vector2.new(1,0); statsLbl.Position=UDim2.new(1,-10,0,8); statsLbl.Size=UDim2.new(0,280,0,16); statsLbl.TextXAlignment=Enum.TextXAlignment.Right
-
-mkHeader(left,"PRIORITY ACTIONS"); local _, autoJoin, _ = mkToggle(left,"AUTO JOIN",State.AutoJoin); local _,_,jrBox=mkStackInput(left,"JOIN RETRY","50",tostring(State.JoinRetry),true)
-mkHeader(left,"MONEY FILTERS");   local _,_,msBox=mkStackInput(left,"MIN M/S","1 (= $1M/s)",tostring(State.MinMS),true)
-mkHeader(left,"НАСТРОЙКИ");       local _, autoInject, _ = mkToggle(left,"AUTO INJECT",State.AutoInject); local _, ignoreToggle, _ = mkToggle(left,"ENABLE IGNORE LIST",State.IgnoreEnabled); local _, ignoreState, ignoreBox=mkStackInput(left,"IGNORE NAMES","name1,name2,...",table.concat(State.IgnoreNames,","),false)
-
-local listHeader=mkHeader(right,"AVAILABLE LOBBIES"); listHeader.Size=UDim2.new(1,0,0,40)
-local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; scroll.Size=UDim2.new(1,0,1,-50); scroll.Position=UDim2.new(0,0,0,46); scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent=right
-local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
-
--- ==== Save settings on changes ====
-local function parseIgnore(s) local r={} for tok in (s or ""):gmatch("([^,%s]+)") do r[#r+1]=tok end return r end
 local function persist()
-    saveJSON(SETTINGS_PATH,{
-        AutoJoin=autoJoin.Value, AutoInject=autoInject.Value, IgnoreEnabled=ignoreToggle.Value,
-        JoinRetry=tonumber(jrBox.Text) or State.JoinRetry, MinMS=tonumber(msBox.Text) or State.MinMS,
-        IgnoreNames=parseIgnore(ignoreBox.Text)
-    })
+    saveJSON(SETTINGS_PATH, { MinM = tonumber(minBox.Text) or Settings.MinM, AutoStart = (startBtn.Text=="STOP") })
 end
-autoJoin.Changed=function(v) State.AutoJoin=v; persist() end
-autoInject.Changed=function(v) State.AutoInject=v; persist() end
-ignoreToggle.Changed=function(v) State.IgnoreEnabled=v; persist() end
-jrBox.FocusLost:Connect(function() State.JoinRetry=tonumber(jrBox.Text) or State.JoinRetry; persist() end)
-msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; persist() end)
-ignoreState.Changed=function(txt) State.IgnoreNames=parseIgnore(txt); persist() end
-persist()
 
--- ==== AutoInject (queue only) ====
-local function pickQueue() local q=nil; pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end); if not q and type(queue_on_teleport)=="function" then q=queue_on_teleport end; if not q and type(queueteleport)=="function" then q=queueteleport end; if not q and type(fluxus)=="table" and type(fluxus.queue_on_teleport)=="function" then q=fluxus.queue_on_teleport end; return q end
-local function makeBootstrap() return "task.spawn(function() if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end; pcall(function() getgenv().__FLOPPA_UI_ACTIVE=nil end); local function g(u) for i=1,3 do local ok,r=pcall(function() return game:HttpGet(u) end); if ok and type(r)=='string' and #r>0 then return r end task.wait(1) end end; local s=g('"..AUTO_INJECT_URL.."'); if s then local f=loadstring(s); if f then pcall(f) end end end)" end
-local function queueReinject() local q=pickQueue(); if q then q(makeBootstrap()) end end
-if State.AutoInject then queueReinject() end
-Players.LocalPlayer.OnTeleport:Connect(function(st) if autoInject.Value and st==Enum.TeleportState.Started then queueReinject() end end)
-
--- ==== Networking (x-api-key) ====
-local function getReqFn()
-    return (syn and syn.request) or http_request or request or (fluxus and fluxus.request) or nil
-end
-local function apiGetJSON(limit)
-    local req = getReqFn()
-    local url = string.format("%s/api/jobs?limit=%d&_cb=%d", SERVER_BASE, limit or 200, math.random(10^6,10^7))
-    if req then
-        local res = req({ Url = url, Method = "GET", Headers = { ["x-api-key"]=API_KEY, ["Accept"]="application/json" }, Timeout = 8 })
-        if res and res.StatusCode == 200 and type(res.Body)=="string" then
-            local ok, data = pcall(function() return HttpService:JSONDecode(res.Body) end)
-            if ok then return true, data end
-        end
-        url = url .. "&key=" .. API_KEY
+-- drag
+local dragging=false; local startPos; local startMouse
+frame.InputBegan:Connect(function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true; startPos=frame.Position; startMouse=input.Position; input.Changed:Connect(function()
+        if input.UserInputState==Enum.UserInputState.End then dragging=false end end)
     end
-    local ok, body = pcall(function() return game:HttpGet(url) end)
-    if not ok or type(body)~="string" or #body==0 then return false end
-    local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
-    if not ok2 then return false end
-    return true, data
-end
-
--- ==== Money parser & filters ====
-local mult={K=1e3,M=1e6,B=1e9,T=1e12}
-local function parseMoneyStr(s)
-    s=tostring(s or ""):gsub(",", ""):upper()
-    local num,unit=s:match("%$%s*([%d%.]+)%s*([KMBT]?)%s*/%s*[Ss]") ; if not num then num,unit=s:match("%$%s*([%d%.]+)%s*([KMBT]?)") end
-    if not num then return 0 end
-    return math.floor((tonumber(num) or 0) * (mult[unit or ""] or 1) + 0.5)
-end
-local function minThreshold() return (tonumber(msBox.Text) or State.MinMS or 0) * 1e6 end
-local function passFilters(d)
-    if d.mps < minThreshold() then return false end
-    if ignoreToggle.Value and #State.IgnoreNames>0 then
-        for _,nm in ipairs(State.IgnoreNames) do if #nm>0 and d.name:lower():find(nm:lower(),1,true) then return false end end
+end)
+UIS.InputChanged:Connect(function(input)
+    if dragging and input.UserInputType==Enum.UserInputType.MouseMovement then
+        local d=input.Position-startMouse; frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
     end
-    return true
+end)
+
+-- ========= Core logic (headless) =========
+local running = false
+local seenKey = {}
+
+local function hash_key(d)
+    return string.format("%s|%s|%d/%d", d.jobId or "", d.moneyStr or "", d.curPlayers or 0, d.maxPlayers or 0)
 end
 
--- ==== Entries, de-dupe & UI list ====
-local Entries, Order = {}, {}
-local SeenHashes = {}               -- всё, что уже было (для инкрементальных добавлений)
-local firstSnapshotDone = false
-
-local function hashOf(item)
-    return string.format("%s|%s|%s", item.jobId or "", item.moneyStr or "", item.playersRaw or "")
+local function min_threshold()
+    local v = tonumber(minBox.Text) or 0
+    return v * 1e6
 end
 
-local function playersFmt(p,m) return string.format("%d/%d", p or 0, m or 0) end
-
-local function ensureItem(jobId, data)
-    local e=Entries[jobId]; if e and e.frame then return e.frame end
-    local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel; item.Parent=scroll; roundify(item,10); stroke(item,COLORS.purpleSoft,1,0.35); padding(item,12,6,12,6)
-    local nameLbl=mkLabel(item, string.upper(data.name), 18, "bold", COLORS.textPrimary); nameLbl.Size=UDim2.new(0.44,-10,1,0)
-    local moneyLbl=mkLabel(item, string.upper(data.moneyStr or ""), 17, "medium", Color3.fromRGB(130,255,130)); moneyLbl.AnchorPoint=Vector2.new(0,0.5); moneyLbl.Position=UDim2.new(0.46,0,0.5,0); moneyLbl.Size=UDim2.new(0.22,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Left
-    local playersLbl=mkLabel(item, playersFmt(data.curPlayers,data.maxPlayers), 16, "medium", COLORS.textWeak); playersLbl.AnchorPoint=Vector2.new(0,0.5); playersLbl.Position=UDim2.new(0.69,0,0.5,0); playersLbl.Size=UDim2.new(0.12,0,1,0); playersLbl.TextXAlignment=Enum.TextXAlignment.Left
-    local joinBtn=Instance.new("TextButton"); joinBtn.Text="JOIN"; setFont(joinBtn,"bold"); joinBtn.TextSize=18; joinBtn.TextColor3=Color3.fromRGB(22,22,22); joinBtn.AutoButtonColor=true; joinBtn.BackgroundColor3=COLORS.joinBtn; joinBtn.Size=UDim2.new(0,84,0,36); joinBtn.AnchorPoint=Vector2.new(1,0.5); joinBtn.Position=UDim2.new(1,-8,0.5,0); roundify(joinBtn,10); stroke(joinBtn,Color3.fromRGB(0,0,0),1,0.7); joinBtn.Parent=item
-    joinBtn.MouseButton1Click:Connect(function()
-        local tries=tonumber(jrBox.Text) or State.JoinRetry or 0; local dSec=0.10; joinBtn.Text="JOIN…"
-        for i=1,math.max(tries,1) do
-            local ok=pcall(function() TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, Players.LocalPlayer) end)
-            if ok then joinBtn.Text="OK"; break else joinBtn.Text=("RETRY %d/%d"):format(i,tries); task.wait(dSec) end
-        end
-        task.delay(0.8,function() if joinBtn then joinBtn.Text="JOIN" end end)
-    end)
-    -- только при первом появлении делаем мягкую подсветку
-    if (os.clock() - (data.firstSeen or os.clock())) <= FRESH_AGE_SEC then
-        item.BackgroundColor3 = Color3.fromRGB(22,28,26)
+local function try_join(jobId)
+    local tries = JOIN_RETRY_COUNT
+    local dt = 1 / math.max(JOIN_RETRY_RATE,1)
+    for i=1,tries do
+        local ok = pcall(function()
+            TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, Players.LocalPlayer)
+        end)
+        if ok then return true end
+        task.wait(dt)
     end
-    Entries[jobId]={data=data, frame=item, firstSeen=os.clock(), lastSeen=os.clock(), refs={nameLbl=nameLbl, moneyLbl=moneyLbl, playersLbl=playersLbl}}
-    return item
+    return false
 end
 
--- условные текстовые апдейты
-local function setTextIfDiff(lbl, s) if lbl and lbl.Text ~= s then lbl.Text = s end end
-
-local function updateItem(jobId, data)
-    local e=Entries[jobId]
-    if not e then ensureItem(jobId, data); table.insert(Order, jobId); e=Entries[jobId]
-    else
-        -- апгрейд данных только если вырос mps
-        if data.mps > (e.data.mps or 0) then e.data = data end
-        e.lastSeen = os.clock()
-    end
-    local r=e.refs
-    if r then
-        setTextIfDiff(r.nameLbl, string.upper(e.data.name))
-        setTextIfDiff(r.moneyLbl, string.upper(e.data.moneyStr or ""))
-        setTextIfDiff(r.playersLbl, playersFmt(e.data.curPlayers,e.data.maxPlayers))
-    end
-end
-
-local function removeItem(jobId)
-    local e=Entries[jobId]; if not e then return end
-    if e.frame then pcall(function() e.frame:Destroy() end) end
-    Entries[jobId]=nil; for i=#Order,1,-1 do if Order[i]==jobId then table.remove(Order,i) break end end
-end
-
--- repaint троттлинг
-local NEED_REPAINT=false
-local lastPaint=0
-local REPAINT_COOLDOWN=0.33
-local lastCanvasY=0
-local function safeUpdateCanvas()
-    local newY = listLay.AbsoluteContentSize.Y + 10
-    if math.abs(newY - lastCanvasY) > 1 then
-        lastCanvasY = newY
-        scroll.CanvasSize = UDim2.new(0,0,0,newY)
-    end
-end
-local function schedulePaint() NEED_REPAINT=true end
-local function resortPaint()
-    -- сортировка по mps desc, затем по lastSeen desc
-    table.sort(Order,function(a,b)
-        local ea,eb=Entries[a],Entries[b]
-        if not ea or not eb then return (a or "")<(b or "") end
-        if ea.data.mps~=eb.data.mps then return ea.data.mps>eb.data.mps end
-        return ea.lastSeen>eb.lastSeen
-    end)
-
-    local shown=0
-    for idx,id in ipairs(Order) do
-        local e=Entries[id]
-        if e and e.frame then
-            e.frame.LayoutOrder=idx
-            -- виртуализация: показываем только топ RENDER_LIMIT
-            local vis = idx <= RENDER_LIMIT
-            if e.frame.Visible ~= vis then e.frame.Visible = vis end
-            -- фон: без постоянных твинов
-            local age=os.clock()-e.firstSeen
-            if age<=FRESH_AGE_SEC then e.frame.BackgroundColor3=Color3.fromRGB(22,28,26) else e.frame.BackgroundColor3=COLORS.surface end
-            shown += vis and 1 or 0
-        end
-    end
-    local minM=tonumber(msBox.Text) or State.MinMS or 0
-    statsLbl.Text=string.format("shown: %d • min: %dM/s", shown, minM)
-    safeUpdateCanvas()
-end
-local function pumpPaint()
-    local now=os.clock()
-    if NEED_REPAINT and (now - lastPaint) >= REPAINT_COOLDOWN then
-        NEED_REPAINT=false
-        lastPaint = now
-        resortPaint()
-    end
-end
-
--- ==== Pull loop (async, incremental) ====
-local function pickBestByServer(items)
-    local bestById={}
-    for _,it in ipairs(items) do
-        local id   = tostring(it.id or it.job_id or "")
-        local name = tostring(it.name or "")
-        local moneyStr = tostring(it.money_per_second or it.money or "")
-        local players  = tostring(it.players or "")
-        if id~="" and name~="" and moneyStr~="" and players~="" then
-            local cur,max = players:match("(%d+)%s*/%s*(%d+)")
-            cur=tonumber(cur or 0) or 0; max=tonumber(max or 0) or 0
-            local mps=parseMoneyStr(moneyStr)
-            local item={jobId=id,name=name,moneyStr=moneyStr,mps=mps,curPlayers=cur,maxPlayers=max,playersRaw=players}
-            if passFilters(item) then
-                local curBest=bestById[id]
-                if (not curBest) or (item.mps>curBest.mps) then bestById[id]=item end
-            end
-        end
-    end
-    return bestById
-end
-
-local wantImmediate = false
-refreshBtn.MouseButton1Click:Connect(function() wantImmediate = true end)
-
--- адаптивный интервал
-local idleFetches=0
-local function adaptInterval(anyNew)
-    if anyNew then
-        idleFetches = 0
-        PULL_INTERVAL_SEC = math.max(PULL_INTERVAL_MIN, PULL_INTERVAL_SEC - 0.2)
-    else
-        idleFetches += 1
-        if idleFetches >= 2 then
-            PULL_INTERVAL_SEC = math.min(PULL_INTERVAL_MAX, PULL_INTERVAL_SEC + 0.3)
-        end
-    end
-end
-
--- главный цикл с мягким шагом
- task.spawn(function()
-    local lastTick = 0
-    while gui and gui.Parent do
-        local now=os.clock()
-        if wantImmediate or (now - lastTick) >= PULL_INTERVAL_SEC then
-            wantImmediate=false
-            lastTick = now
-            local ok, data = apiGetJSON(250)
-            local changedForResort=false
-            local changedOnlyLabels=false
-            if ok and type(data)=="table" and type(data.items)=="table" then
-                local best = pickBestByServer(data.items)
-
-                if not firstSnapshotDone then
-                    for _,d in pairs(best) do SeenHashes[hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})]=true end
-                    firstSnapshotDone = true
-                    changedForResort = true
-                else
-                    local anyNew=false
-                    for _,d in pairs(best) do
-                        local h = hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})
-                        local existing = Entries[d.jobId]
-                        if not SeenHashes[h] then
-                            SeenHashes[h]=true
-                            updateItem(d.jobId, d)
-                            changedForResort=true
-                            anyNew=true
+local function loop()
+    running = true
+    status.Text = "status: running"
+    while running do
+        local ok, items = fetch_items(220)
+        if ok then
+            local best = pick_best_by_server(items)
+            local mind = min_threshold()
+            local any = false
+            for _, d in pairs(best) do
+                if d.mps >= mind then
+                    local key = hash_key(d)
+                    if not seenKey[key] then
+                        seenKey[key] = true
+                        any = true
+                        status.Text = string.format("joining: %s ($%s)", tostring(d.name or "?"), tostring(d.moneyStr or ""))
+                        local joined = try_join(d.jobId)
+                        if joined then
+                            status.Text = "joined successfully"
+                            running = false
+                            break
                         else
-                            if existing then
-                                local oldCur, oldMax = existing.data.curPlayers, existing.data.maxPlayers
-                                if oldCur ~= d.curPlayers or oldMax ~= d.maxPlayers then
-                                    existing.data.curPlayers=d.curPlayers
-                                    existing.data.maxPlayers=d.maxPlayers
-                                    existing.lastSeen = os.clock()
-                                    -- только текст обновить
-                                    local r = existing.refs
-                                    if r then setTextIfDiff(r.playersLbl, playersFmt(d.curPlayers,d.maxPlayers)) end
-                                    changedOnlyLabels=true
-                                end
-                            end
+                            status.Text = "join failed; skipping"
                         end
                     end
-                    -- чистим протухшие
-                    for id,e in pairs(Entries) do if (os.clock()-e.lastSeen) > ENTRY_TTL_SEC then removeItem(id); changedForResort=true end end
-                    adaptInterval(anyNew)
                 end
-            else
-                adaptInterval(false)
             end
-            if changedForResort or changedOnlyLabels then schedulePaint() end
+            if not any then status.Text = "status: running (no candidates)" end
+        else
+            status.Text = "fetch error; retrying"
         end
-        pumpPaint()
-        task.wait(0.05)
+        persist()
+        for t=1, math.floor(PULL_INTERVAL_SEC/0.05) do if not running then break end task.wait(0.05) end
+    end
+    status.Text = "status: stopped"
+    persist()
+end
+
+startBtn.MouseButton1Click:Connect(function()
+    if running then
+        running = false
+        startBtn.Text = "START AUTO JOIN"
+        status.Text = "status: stopped"
+    else
+        startBtn.Text = "STOP"
+        persist()
+        task.spawn(loop)
     end
 end)
 
--- ==== Show/Hide & Drag ====
-local function makeDraggable(frame, handle)
-    handle=handle or frame; local dragging=false; local startPos; local startMouse
-    handle.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true; startPos=frame.Position; startMouse=input.Position; input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end) end end)
-    UIS.InputChanged:Connect(function(input) if dragging and input.UserInputType==Enum.UserInputType.MouseMovement then local d=input.Position-startMouse; frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y) end end)
+-- AutoStart (if enabled)
+if Settings.AutoStart then
+    task.spawn(loop)
 end
-local opened=true
-local function setVisible(v,inst) opened=v; if v then setBlur(true) else setBlur(false) end
-    local goal=v and UDim2.new(0.5,-490,0.5,-280) or UDim2.new(0.5,-490,1,30)
-    if inst then main.Position=goal; main.Visible=v
-    else if v then main.Visible=true end; main.Position = goal; if not v then main.Visible=false end end end
-UIS.InputBegan:Connect(function(input,gp) if not gp and input.KeyCode==FIXED_HOTKEY then setVisible(not opened,false) end end)
-makeDraggable(main, header)
 
--- финализация
- task.defer(function()
-    updLeftCanvas(); setVisible(true,true)
-end)
+print("[MiniAJ] Ready")
