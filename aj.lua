@@ -198,21 +198,25 @@ local function getCardFromPool()
     padding(item,12,6,12,6)
     
     local nameLbl=mkLabel(item,"",18,"bold",COLORS.textPrimary)
+    nameLbl.Name = "NameLabel"
     nameLbl.Size=UDim2.new(0.44,-10,1,0)
     
     local moneyLbl=mkLabel(item,"",17,"medium",Color3.fromRGB(130,255,130))
+    moneyLbl.Name = "MoneyLabel"
     moneyLbl.AnchorPoint=Vector2.new(0,0.5)
     moneyLbl.Position=UDim2.new(0.46,0,0.5,0)
     moneyLbl.Size=UDim2.new(0.22,0,1,0)
     moneyLbl.TextXAlignment=Enum.TextXAlignment.Left
     
     local playersLbl=mkLabel(item,"",16,"medium",COLORS.textWeak)
+    playersLbl.Name = "PlayersLabel"
     playersLbl.AnchorPoint=Vector2.new(0,0.5)
     playersLbl.Position=UDim2.new(0.69,0,0.5,0)
     playersLbl.Size=UDim2.new(0.12,0,1,0)
     playersLbl.TextXAlignment=Enum.TextXAlignment.Left
     
     local joinBtn=Instance.new("TextButton")
+    joinBtn.Name = "JoinButton"
     joinBtn.Text="JOIN"
     setFont(joinBtn,"bold")
     joinBtn.TextSize=18
@@ -225,11 +229,6 @@ local function getCardFromPool()
     roundify(joinBtn,10)
     stroke(joinBtn,Color3.fromRGB(0,0,0),1,0.7)
     joinBtn.Parent=item
-    
-    item:SetAttribute("nameLbl", nameLbl)
-    item:SetAttribute("moneyLbl", moneyLbl)
-    item:SetAttribute("playersLbl", playersLbl)
-    item:SetAttribute("joinBtn", joinBtn)
     
     return item
 end
@@ -247,18 +246,27 @@ local function updateCard(card, jobId, data, index)
     card.LayoutOrder = index
     card.Position = UDim2.new(0, 0, 0, (index - 1) * CARD_HEIGHT)
     
-    local nameLbl = card:GetAttribute("nameLbl")
-    local moneyLbl = card:GetAttribute("moneyLbl")
-    local playersLbl = card:GetAttribute("playersLbl")
-    local joinBtn = card:GetAttribute("joinBtn")
+    -- Исправлено: GetAttribute возвращает nil, нужно искать children
+    local nameLbl = card:FindFirstChild("NameLabel")
+    local moneyLbl = card:FindFirstChild("MoneyLabel")
+    local playersLbl = card:FindFirstChild("PlayersLabel")
+    local joinBtn = card:FindFirstChild("JoinButton")
+    
+    if not nameLbl or not moneyLbl or not playersLbl or not joinBtn then
+        warn("Card components not found!")
+        return
+    end
     
     nameLbl.Text = string.upper(data.name)
     moneyLbl.Text = string.upper(data.moneyStr or "")
     playersLbl.Text = playersFmt(data.curPlayers, data.maxPlayers)
     
-    -- Обновляем обработчик JOIN кнопки
-    for _, conn in ipairs(joinBtn:GetConnections()) do
-        conn:Disconnect()
+    -- Обновляем обработчик JOIN кнопки - используем :GetConnections() правильно
+    local connections = getconnections and getconnections(joinBtn.MouseButton1Click) or {}
+    for _, conn in ipairs(connections) do
+        if conn.Disconnect then
+            conn:Disconnect()
+        end
     end
     
     joinBtn.MouseButton1Click:Connect(function()
@@ -281,7 +289,7 @@ local function updateCard(card, jobId, data, index)
                     joinBtn.BackgroundColor3 = Color3.fromRGB(220, 120, 50)
                     
                     if attempt < tries then
-                        task.wait(0.1)  -- Короткая задержка между попытками
+                        task.wait(0.1)
                     end
                 end
             end
@@ -524,14 +532,25 @@ task.spawn(function()
                 wantImmediate = false
                 lastTick = now
                 
+                -- Добавляем debug вывод
+                print("[FLOPPA] Fetching data...")
+                
                 task.spawn(function()
                     local ok, data = apiGetJSON(FETCH_LIMIT)
+                    
+                    print("[FLOPPA] API result:", ok, data and type(data.items) or "nil")
                     
                     if ok and type(data) == "table" and type(data.items) == "table" then
                         local best = pickBestByServer(data.items)
                         
+                        print("[FLOPPA] Best servers found:", #best > 0 and "yes" or "no")
+                        local count = 0
+                        for _ in pairs(best) do count = count + 1 end
+                        print("[FLOPPA] Total best servers:", count)
+                        
                         if not firstSnapshotDone then
                             -- Первая загрузка - добавляем все сразу
+                            print("[FLOPPA] First snapshot, adding all entries...")
                             for _, d in pairs(best) do
                                 SeenHashes[hashOf({
                                     jobId = d.jobId,
@@ -541,9 +560,11 @@ task.spawn(function()
                                 addOrUpdateEntry(d.jobId, d)
                             end
                             firstSnapshotDone = true
+                            print("[FLOPPA] Sorting and rendering...")
                             sortEntries()
                             renderVisibleCards()
                             updateStats()
+                            print("[FLOPPA] First snapshot complete. Entries:", #SortedOrder)
                         else
                             -- Инкрементальное обновление
                             local updated = false
@@ -573,7 +594,11 @@ task.spawn(function()
                                 renderVisibleCards()
                                 updateStats()
                             end
+                            
+                            print("[FLOPPA] Update complete. Entries:", #SortedOrder, "Active cards:", #ActiveCards)
                         end
+                    else
+                        print("[FLOPPA] API fetch failed or invalid data")
                     end
                     
                     isUpdating = false
