@@ -61,6 +61,8 @@ local state = {
     retryActive = false,
     networkError = false,
     currentJobId = nil,
+    uiVisible = true,
+    screenGui = nil,
 }
 
 -- Utility Functions
@@ -913,6 +915,19 @@ local function main()
     
     -- Create UI
     local screenGui, leftPanel, rightPanel, errorBanner = createUI()
+    state.screenGui = screenGui
+    
+    -- Toggle UI visibility with K key
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        
+        if input.KeyCode == Enum.KeyCode.K then
+            state.uiVisible = not state.uiVisible
+            if screenGui then
+                screenGui.Enabled = state.uiVisible
+            end
+        end
+    end)
     
     -- Retry timer
     local lastRetryTime = 0
@@ -929,15 +944,24 @@ local function main()
             wait(0.05) -- Slow down if FPS drops
         end
         
-        -- Poll servers
-        if currentTime - state.lastPollTime >= CONFIG.POLL_RATE then
-            state.lastPollTime = currentTime
-            updateServers()
-            updateServerList(rightPanel)
+        -- Only update UI if visible
+        if state.uiVisible then
+            -- Poll servers
+            if currentTime - state.lastPollTime >= CONFIG.POLL_RATE then
+                state.lastPollTime = currentTime
+                updateServers()
+                updateServerList(rightPanel)
+            end
+            
+            -- Update error banner
+            errorBanner.Visible = state.networkError
+        else
+            -- Still poll servers in background (but don't update UI)
+            if currentTime - state.lastPollTime >= CONFIG.POLL_RATE then
+                state.lastPollTime = currentTime
+                updateServers()
+            end
         end
-        
-        -- Update error banner
-        errorBanner.Visible = state.networkError
         
         -- Process retry (every 100ms)
         if currentTime - lastRetryTime >= CONFIG.RETRY_RATE then
@@ -951,10 +975,11 @@ local function main()
     
     -- Initial update
     updateServers()
-    updateServerList(rightPanel)
+    if state.uiVisible then
+        updateServerList(rightPanel)
+    end
 end
 
 -- Start
 main()
  
-
