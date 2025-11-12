@@ -8,7 +8,7 @@
   • Auto Join с retry функционалом
 ]]
 
-local SCRIPT_VERSION = "7.0"
+local SCRIPT_VERSION = "2.0"
 
 ------------------ USER SETTINGS ------------------
 local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
@@ -369,86 +369,80 @@ end
 
 -- Получение данных с API
 local function fetchServerData()
-    local ok, result = pcall(function()
-        local headers = {}
-        if API_KEY and #API_KEY > 0 then
-            headers["X-API-Key"] = API_KEY
-            headers["Authorization"] = "Bearer " .. API_KEY
-        end
-        
-        -- Пробуем разные способы HTTP запросов
-        local responseBody = nil
-        
-        -- Способ 1: syn.request
-        if syn and syn.request then
-            local success, response = pcall(function()
-                return syn.request({
-                    Url = API_URL,
-                    Method = "GET",
-                    Headers = headers
-                })
-            end)
-            if success and response and response.Body and type(response.Body) == "string" and #response.Body > 0 then
-                responseBody = response.Body
-            end
-        end
-        
-        -- Способ 2: request (другие executors)
-        if not responseBody and request then
-            local success, response = pcall(function()
-                return request({
-                    Url = API_URL,
-                    Method = "GET",
-                    Headers = headers
-                })
-            end)
-            if success and response and response.Body and type(response.Body) == "string" and #response.Body > 0 then
-                responseBody = response.Body
-            end
-        end
-        
-        -- Способ 3: HttpService.RequestAsync
-        if not responseBody and HttpService and HttpService.RequestAsync then
-            local success, response = pcall(function()
-                return HttpService:RequestAsync({
-                    Url = API_URL,
-                    Method = "GET",
-                    Headers = headers
-                })
-            end)
-            if success and response and response.Body and type(response.Body) == "string" and #response.Body > 0 then
-                responseBody = response.Body
-            end
-        end
-        
-        -- Способ 4: game:HttpGet (последний вариант)
-        if not responseBody and game.HttpGet then
-            local success, body = pcall(function()
-                -- Пробуем с headers и без
-                if headers and next(headers) then
-                    return game:HttpGet(API_URL, true, headers)
-                else
-                    return game:HttpGet(API_URL, true)
-                end
-            end)
-            if success and body and type(body) == "string" and #body > 0 then
-                responseBody = body
-            end
-        end
-        
-        return responseBody
-    end)
+    local responseBody = nil
+    local headers = {}
+    if API_KEY and #API_KEY > 0 then
+        headers["X-API-Key"] = API_KEY
+        headers["Authorization"] = "Bearer " .. API_KEY
+    end
     
-    if ok and result and type(result) == "string" and #result > 0 then
+    -- Способ 1: syn.request
+    if syn and syn.request then
+        local success, response = pcall(function()
+            return syn.request({
+                Url = API_URL,
+                Method = "GET",
+                Headers = headers
+            })
+        end)
+        if success and response and response.Body and type(response.Body) == "string" and #response.Body > 0 then
+            responseBody = response.Body
+        end
+    end
+    
+    -- Способ 2: request (другие executors)
+    if not responseBody and request then
+        local success, response = pcall(function()
+            return request({
+                Url = API_URL,
+                Method = "GET",
+                Headers = headers
+            })
+        end)
+        if success and response and response.Body and type(response.Body) == "string" and #response.Body > 0 then
+            responseBody = response.Body
+        end
+    end
+    
+    -- Способ 3: HttpService.RequestAsync
+    if not responseBody and HttpService and HttpService.RequestAsync then
+        local success, response = pcall(function()
+            return HttpService:RequestAsync({
+                Url = API_URL,
+                Method = "GET",
+                Headers = headers
+            })
+        end)
+        if success and response and response.Body and type(response.Body) == "string" and #response.Body > 0 then
+            responseBody = response.Body
+        end
+    end
+    
+    -- Способ 4: game:HttpGet (последний вариант)
+    if not responseBody and game.HttpGet then
+        local success, body = pcall(function()
+            if headers and next(headers) then
+                return game:HttpGet(API_URL, true, headers)
+            else
+                return game:HttpGet(API_URL, true)
+            end
+        end)
+        if success and body and type(body) == "string" and #body > 0 then
+            responseBody = body
+        end
+    end
+    
+    -- Парсинг данных
+    if responseBody and type(responseBody) == "string" and #responseBody > 0 then
         -- Проверяем, что это не HTML
-        if not result:find("<!DOCTYPE") and not result:find("<html") and not result:find("<body") and not result:find("<!doctype") then
-            local parsed = parseServerData(result)
-            -- Проверяем, что парсинг дал результаты
+        if not responseBody:find("<!DOCTYPE") and not responseBody:find("<html") and not responseBody:find("<body") and not responseBody:find("<!doctype") then
+            local parsed = parseServerData(responseBody)
             if parsed and type(parsed) == "table" and #parsed > 0 then
                 return parsed
             end
         end
     end
+    
     return {}
 end
 
@@ -561,11 +555,16 @@ local function createServerCard(server, parent, index)
 end
 
 -- Обновление списка серверов
+local isUpdating = false
 local function updateServerList()
+    if isUpdating then return end
+    isUpdating = true
+    
     task.spawn(function()
-        local ok, err = pcall(function()
+        pcall(function()
             -- Проверяем, что UI элементы созданы
             if not ServerListFrame or not ServerListLayout then 
+                isUpdating = false
                 return 
             end
             
@@ -578,13 +577,7 @@ local function updateServerList()
             end
             
             -- Получение данных с API
-            local allServers = {}
-            local success, fetched = pcall(function()
-                return fetchServerData()
-            end)
-            if success and fetched and type(fetched) == "table" and #fetched > 0 then
-                allServers = fetched
-            end
+            local allServers = fetchServerData()
             
             -- Если серверов нет, обновляем canvas и выходим
             if not allServers or type(allServers) ~= "table" or #allServers == 0 then
@@ -592,30 +585,25 @@ local function updateServerList()
                 if updateServerListCanvas then
                     pcall(updateServerListCanvas)
                 end
+                isUpdating = false
                 return
             end
             
             -- Фильтрация серверов
-            local filtered = {}
-            pcall(function()
-                filtered = filterServers(allServers)
-            end)
+            local filtered = filterServers(allServers)
             
             if #filtered > 0 then
                 -- Сортировка по moneyPerSec (по убыванию)
-                pcall(function()
-                    table.sort(filtered, function(a, b) 
-                        return (a.moneyPerSec or 0) > (b.moneyPerSec or 0) 
-                    end)
+                table.sort(filtered, function(a, b) 
+                    return (a.moneyPerSec or 0) > (b.moneyPerSec or 0) 
                 end)
                 
                 -- Создание карточек
                 for i, server in ipairs(filtered) do
                     if server and server.serverId and server.name then
                         pcall(function() 
-                            local card = createServerCard(server, ServerListFrame, i)
+                            createServerCard(server, ServerListFrame, i)
                         end)
-                        -- Небольшая задержка между созданием карточек
                         task.wait(0.01)
                     end
                 end
@@ -627,9 +615,7 @@ local function updateServerList()
                 pcall(updateServerListCanvas)
             end
         end)
-        if not ok then
-            -- Тихая ошибка, не крашим скрипт
-        end
+        isUpdating = false
     end)
 end
 
@@ -796,15 +782,20 @@ local function setVisible(v,instant)
     end
     -- Обновляем список при открытии окна
     if v and updateServerList then
-        task.delay(0.1, function()
-            pcall(function()
-                updateServerList()
-            end)
+        -- Немедленное обновление
+        task.spawn(function()
+            updateServerList()
         end)
-        task.delay(0.5, function()
-            pcall(function()
+        -- Дополнительные обновления с задержкой
+        task.delay(0.3, function()
+            if updateServerList then
                 updateServerList()
-            end)
+            end
+        end)
+        task.delay(1, function()
+            if updateServerList then
+                updateServerList()
+            end
         end)
     end
 end
@@ -832,46 +823,46 @@ task.defer(function()
             pcall(refreshUI)
         end)
         -- Первое обновление списка - сразу и с задержкой
-        task.delay(0.2, function()
-            pcall(function()
-                if updateServerList then
-                    updateServerList()
-                end
-            end)
+        task.spawn(function()
+            task.wait(0.2)
+            if updateServerList then
+                updateServerList()
+            end
         end)
-        task.delay(1, function()
-            pcall(function()
-                if updateServerList then
-                    updateServerList()
-                end
-            end)
+        task.spawn(function()
+            task.wait(1)
+            if updateServerList then
+                updateServerList()
+            end
+        end)
+        task.spawn(function()
+            task.wait(2)
+            if updateServerList then
+                updateServerList()
+            end
         end)
     end)
 end)
 
 -- Периодическое обновление списка серверов (работает всегда, даже когда окно закрыто)
 task.spawn(function()
-    task.wait(0.5) -- Первая задержка перед началом
+    task.wait(2) -- Первая задержка перед началом
     while true do
-        pcall(function()
-            if updateServerList then
-                updateServerList()
-            end
-        end)
+        if updateServerList then
+            updateServerList()
+        end
         task.wait(UPDATE_INTERVAL)
     end
 end)
 
--- Дополнительное обновление каждые 10 секунд (на случай если основное не сработало)
+-- Дополнительное обновление каждые 5 секунд для надежности
 task.spawn(function()
     task.wait(5)
     while true do
-        pcall(function()
-            if updateServerList then
-                updateServerList()
-            end
-        end)
-        task.wait(10)
+        if updateServerList then
+            updateServerList()
+        end
+        task.wait(5)
     end
 end)
 
