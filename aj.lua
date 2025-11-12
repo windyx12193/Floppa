@@ -8,7 +8,7 @@
   • Auto Join с retry функционалом
 ]]
 
-local SCRIPT_VERSION = "5.0"
+local SCRIPT_VERSION = "4.0"
 
 ------------------ USER SETTINGS ------------------
 local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
