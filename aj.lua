@@ -8,7 +8,7 @@
   • Auto Join с retry функционалом
 ]]
 
-local SCRIPT_VERSION = "5.0"
+local SCRIPT_VERSION = "6.0"
 
 ------------------ USER SETTINGS ------------------
 local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
@@ -301,8 +301,6 @@ if not player then
 end
 
 local ServerData = {} -- {name, moneyPerSec, online, serverId, timestamp}
-local ServerListFrame = nil
-local ServerListLayout = nil
 local isJoining = false
 local currentJoinAttempts = 0
 local lastTeleportError = ""
@@ -438,6 +436,16 @@ local function fetchServerData()
             end
         end
         
+        -- Способ 5: HttpService:GetAsync (если доступен)
+        if not responseBody and HttpService and HttpService.GetAsync then
+            local success, body = pcall(function()
+                return HttpService:GetAsync(API_URL, true)
+            end)
+            if success and body and type(body) == "string" and #body > 0 then
+                responseBody = body
+            end
+        end
+        
         return responseBody
     end)
     
@@ -445,7 +453,10 @@ local function fetchServerData()
         -- Проверяем, что это не HTML
         if not result:find("<!DOCTYPE") and not result:find("<html") and not result:find("<body") and not result:find("<!doctype") then
             local parsed = parseServerData(result)
-            return parsed
+            -- Проверяем, что парсинг дал результаты
+            if parsed and type(parsed) == "table" and #parsed > 0 then
+                return parsed
+            end
         end
     end
     return {}
@@ -562,8 +573,8 @@ end
 -- Обновление списка серверов
 local function updateServerList()
     local ok, err = pcall(function()
-        if not ServerListFrame then 
-            task.wait(0.5)
+        -- Проверяем, что UI элементы созданы
+        if not ServerListFrame or not ServerListLayout then 
             return 
         end
         
@@ -575,11 +586,19 @@ local function updateServerList()
             end
         end
         
-        -- Получение данных с API
+        -- Получение данных с API (с повторными попытками)
         local allServers = {}
-        pcall(function()
-            allServers = fetchServerData()
-        end)
+        for attempt = 1, 3 do
+            pcall(function()
+                local fetched = fetchServerData()
+                if fetched and type(fetched) == "table" and #fetched > 0 then
+                    allServers = fetched
+                    break
+                end
+            end)
+            if #allServers > 0 then break end
+            if attempt < 3 then task.wait(0.5) end
+        end
         
         -- Если серверов нет, обновляем canvas и выходим
         if not allServers or type(allServers) ~= "table" or #allServers == 0 then
@@ -790,8 +809,15 @@ local function setVisible(v,instant)
     end
     -- Обновляем список при открытии окна
     if v and updateServerList then
-        task.delay(0.2, function()
-            pcall(updateServerList)
+        task.delay(0.1, function()
+            pcall(function()
+                updateServerList()
+            end)
+        end)
+        task.delay(0.5, function()
+            pcall(function()
+                updateServerList()
+            end)
         end)
     end
 end
@@ -838,16 +864,30 @@ end)
 
 -- Периодическое обновление списка серверов (работает всегда, даже когда окно закрыто)
 task.spawn(function()
-    task.wait(1) -- Первая задержка перед началом
+    task.wait(0.5) -- Первая задержка перед началом
     while true do
         pcall(function()
             if updateServerList then
                 updateServerList()
             end
-            task.wait(UPDATE_INTERVAL)
         end)
+        task.wait(UPDATE_INTERVAL)
     end
 end)
+
+-- Дополнительное обновление каждые 10 секунд (на случай если основное не сработало)
+task.spawn(function()
+    task.wait(5)
+    while true do
+        pcall(function()
+            if updateServerList then
+                updateServerList()
+            end
+        end)
+        task.wait(10)
+    end
+end)
+
 
 -- Периодическая проверка Auto Join
 task.spawn(function()
