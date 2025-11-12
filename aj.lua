@@ -1,10 +1,14 @@
 --[[
-  FLOPPA AUTO JOINER - Luau-safe v4.7 (JSON-first init)
+  FLOPPA AUTO JOINER - Luau-safe v5.0 (API Integration)
   • Хоткей фикс.: T
   • queue_on_teleport bootstrap (без run-now), сброс __FLOPPA_UI_ACTIVE
   • Конфиг JSON читается ДО создания UI → тумблеры/поля рисуются сразу правильно
   • Финальный refreshUI() после показа окна
+  • API интеграция с автоматическим обновлением списка серверов
+  • Auto Join с retry функционалом
 ]]
+
+local SCRIPT_VERSION = "5.0"
 
 ------------------ USER SETTINGS ------------------
 local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
@@ -183,7 +187,12 @@ roundify(main,14); stroke(main, COLORS.purpleSoft, 1.5, 0.35); padding(main,10,1
 -- Header
 local header=Instance.new("Frame"); header.Size=UDim2.new(1,0,0,48); header.BackgroundColor3=COLORS.surface2; header.BackgroundTransparency=ALPHA.card; header.Parent=main
 roundify(header,10); stroke(header); padding(header,14,6,14,6)
-mkLabel(header,"FLOPPA AUTO JOINER",20,"bold",COLORS.textPrimary).Size=UDim2.new(0.6,0,1,0)
+local titleLabel=mkLabel(header,"FLOPPA AUTO JOINER",20,"bold",COLORS.textPrimary)
+titleLabel.Size=UDim2.new(0.5,0,1,0)
+local versionLabel=mkLabel(header,"v"..SCRIPT_VERSION,12,"medium",COLORS.purpleSoft)
+versionLabel.Position=UDim2.new(0,180,0,0)
+versionLabel.Size=UDim2.new(0,50,1,0)
+versionLabel.TextXAlignment=Enum.TextXAlignment.Left
 local hotkeyInfo=mkLabel(header,"OPEN GUI KEY:  T",16,"medium",COLORS.textWeak)
 hotkeyInfo.AnchorPoint=Vector2.new(1,0.5); hotkeyInfo.Position=UDim2.new(1,-14,0.5,0); hotkeyInfo.Size=UDim2.new(0.35,0,1,0); hotkeyInfo.TextXAlignment=Enum.TextXAlignment.Right
 
@@ -292,21 +301,26 @@ end
 local function parseServerData(rawText)
     local servers = {}
     local ok, err = pcall(function()
-        if not rawText or type(rawText) ~= "string" then return servers end
+        if not rawText or type(rawText) ~= "string" or #rawText == 0 then return servers end
         
+        -- Разбиваем на строки
         for line in rawText:gmatch("[^\r\n]+") do
             local lineOk, lineErr = pcall(function()
                 line = line:match("^%s*(.-)%s*$") -- trim
                 if #line > 0 and line:find("|") then
                     local parts = {}
+                    -- Разбиваем по разделителю |
                     for part in line:gmatch("([^|]+)") do
-                        table.insert(parts, part:match("^%s*(.-)%s*$"))
+                        local trimmed = part:match("^%s*(.-)%s*$")
+                        if trimmed and #trimmed > 0 then
+                            table.insert(parts, trimmed)
+                        end
                     end
                     if #parts >= 4 then
-                        local name = (parts[1] or ""):gsub("^%s*(.-)%s*$", "%1")
-                        local moneyStr = (parts[2] or ""):gsub("%*", ""):gsub("^%s*(.-)%s*$", "%1")
-                        local onlineStr = (parts[3] or ""):gsub("%*", ""):gsub("^%s*(.-)%s*$", "%1")
-                        local serverId = (parts[4] or ""):gsub("^%s*(.-)%s*$", "%1")
+                        local name = (parts[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                        local moneyStr = (parts[2] or ""):gsub("%*", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                        local onlineStr = (parts[3] or ""):gsub("%*", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                        local serverId = (parts[4] or ""):gsub("^%s+", ""):gsub("%s+$", "")
                         
                         -- Парсинг online (7/8, 6/8)
                         local current, max = onlineStr:match("(%d+)/(%d+)")
@@ -315,7 +329,8 @@ local function parseServerData(rawText)
                         
                         local moneyPerSec = parseMoneyPerSecond(moneyStr)
                         
-                        if #name > 0 and #serverId > 0 then
+                        -- Проверяем, что есть имя и serverId
+                        if name and #name > 0 and serverId and #serverId > 0 then
                             table.insert(servers, {
                                 name = name,
                                 moneyPerSec = moneyPerSec,
@@ -349,7 +364,7 @@ local function fetchServerData()
                 Method = "GET",
                 Headers = headers
             })
-            if response and response.Body then
+            if response and response.Body and type(response.Body) == "string" then
                 return response.Body
             end
         elseif request then
@@ -358,7 +373,7 @@ local function fetchServerData()
                 Method = "GET",
                 Headers = headers
             })
-            if response and response.Body then
+            if response and response.Body and type(response.Body) == "string" then
                 return response.Body
             end
         elseif HttpService and HttpService.RequestAsync then
@@ -367,17 +382,23 @@ local function fetchServerData()
                 Method = "GET",
                 Headers = headers
             })
-            if response and response.Body then
+            if response and response.Body and type(response.Body) == "string" then
                 return response.Body
             end
         elseif game.HttpGet then
-            return game:HttpGet(API_URL, false, headers)
+            -- Правильный вызов HttpGet
+            local success, body = pcall(function()
+                return game:HttpGet(API_URL, true, headers)
+            end)
+            if success and body and type(body) == "string" then
+                return body
+            end
         end
         return nil
     end)
     if ok and result and type(result) == "string" and #result > 0 then
         -- Проверяем, что это не HTML
-        if not result:find("<!DOCTYPE") and not result:find("<html") then
+        if not result:find("<!DOCTYPE") and not result:find("<html") and not result:find("<body") then
             return parseServerData(result)
         end
     end
@@ -498,7 +519,8 @@ local function updateServerList()
         if not ServerListFrame then return end
         
         -- Очистка старых карточек
-        for _, child in ipairs(ServerListFrame:GetChildren()) do
+        local children = ServerListFrame:GetChildren()
+        for _, child in ipairs(children) do
             if child:IsA("Frame") and child.Name:find("ServerCard_") then
                 pcall(function() child:Destroy() end)
             end
@@ -506,18 +528,40 @@ local function updateServerList()
         
         -- Получение и фильтрация серверов
         local allServers = fetchServerData()
-        local filtered = filterServers(allServers)
-        
-        -- Сортировка по moneyPerSec (по убыванию)
-        table.sort(filtered, function(a, b) return a.moneyPerSec > b.moneyPerSec end)
-        
-        -- Создание карточек
-        for i, server in ipairs(filtered) do
-            pcall(function() createServerCard(server, ServerListFrame, i) end)
+        if not allServers or #allServers == 0 then
+            -- Если серверов нет, обновляем canvas и выходим
+            task.wait(0.1)
+            if updateServerListCanvas then
+                pcall(updateServerListCanvas)
+            end
+            return
         end
         
-        -- Обновление размера canvas будет через updateServerListCanvas
-        task.wait()
+        local filtered = filterServers(allServers)
+        
+        if #filtered > 0 then
+            -- Сортировка по moneyPerSec (по убыванию)
+            pcall(function()
+                table.sort(filtered, function(a, b) 
+                    return (a.moneyPerSec or 0) > (b.moneyPerSec or 0) 
+                end)
+            end)
+            
+            -- Создание карточек
+            for i, server in ipairs(filtered) do
+                if server and server.serverId then
+                    pcall(function() 
+                        local card = createServerCard(server, ServerListFrame, i)
+                        if not card then
+                            -- Если карточка не создалась, пропускаем
+                        end
+                    end)
+                end
+            end
+        end
+        
+        -- Обновление размера canvas
+        task.wait(0.1)
         if updateServerListCanvas then
             pcall(updateServerListCanvas)
         end
@@ -687,6 +731,12 @@ local function setVisible(v,instant)
         if v then main.Visible=true end
         local t=TweenService:Create(main, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Position=goal})
         t:Play(); if not v then t.Completed:Wait(); main.Visible=false end
+    end
+    -- Обновляем список при открытии окна
+    if v and updateServerList then
+        task.delay(0.2, function()
+            pcall(updateServerList)
+        end)
     end
 end
 
