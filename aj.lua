@@ -257,15 +257,18 @@ end
 
 autoJoin.Changed     = function(v) State.AutoJoin=v;      saveSettings() end
 autoInject.Changed   = function(v) State.AutoInject=v;    saveSettings() end
-ignoreToggle.Changed = function(v) State.IgnoreEnabled=v; saveSettings(); updateServerList() end
+ignoreToggle.Changed = function(v) State.IgnoreEnabled=v; saveSettings(); task.defer(function() if updateServerList then updateServerList() end end) end
 jrBox.FocusLost:Connect(function() State.JoinRetry=tonumber(jrBox.Text) or State.JoinRetry; saveSettings() end)
-msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; saveSettings(); updateServerList() end)
-ignoreState.Changed  = function(txt) State.IgnoreNames=parseIgnore(txt); saveSettings(); updateServerList() end
+msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; saveSettings(); task.defer(function() if updateServerList then updateServerList() end end) end)
+ignoreState.Changed  = function(txt) State.IgnoreNames=parseIgnore(txt); saveSettings(); task.defer(function() if updateServerList then updateServerList() end end) end
 
 -- === API & Server Data ===
 local TeleportService = game:GetService("TeleportService")
 local LogService = game:GetService("LogService")
 local player = Players.LocalPlayer
+if not player then
+    player = Players:WaitForChild("LocalPlayer", 10)
+end
 
 local ServerData = {} -- {name, moneyPerSec, online, serverId, timestamp}
 local ServerListFrame = nil
@@ -288,41 +291,45 @@ end
 -- Парсинг данных с API
 local function parseServerData(rawText)
     local servers = {}
-    if not rawText or type(rawText) ~= "string" then return servers end
-    
-    for line in rawText:gmatch("[^\r\n]+") do
-        line = line:match("^%s*(.-)%s*$") -- trim
-        if #line > 0 and line:find("|") then
-            local parts = {}
-            for part in line:gmatch("([^|]+)") do
-                table.insert(parts, part:match("^%s*(.-)%s*$"))
-            end
-            if #parts >= 4 then
-                local name = (parts[1] or ""):gsub("^%s*(.-)%s*$", "%1")
-                local moneyStr = (parts[2] or ""):gsub("%*", ""):gsub("^%s*(.-)%s*$", "%1")
-                local onlineStr = (parts[3] or ""):gsub("%*", ""):gsub("^%s*(.-)%s*$", "%1")
-                local serverId = (parts[4] or ""):gsub("^%s*(.-)%s*$", "%1")
-                
-                -- Парсинг online (7/8, 6/8)
-                local current, max = onlineStr:match("(%d+)/(%d+)")
-                current = tonumber(current) or 0
-                max = tonumber(max) or 8
-                
-                local moneyPerSec = parseMoneyPerSecond(moneyStr)
-                
-                if #name > 0 and #serverId > 0 then
-                    table.insert(servers, {
-                        name = name,
-                        moneyPerSec = moneyPerSec,
-                        online = current,
-                        maxOnline = max,
-                        serverId = serverId,
-                        onlineStr = onlineStr
-                    })
+    local ok, err = pcall(function()
+        if not rawText or type(rawText) ~= "string" then return servers end
+        
+        for line in rawText:gmatch("[^\r\n]+") do
+            local lineOk, lineErr = pcall(function()
+                line = line:match("^%s*(.-)%s*$") -- trim
+                if #line > 0 and line:find("|") then
+                    local parts = {}
+                    for part in line:gmatch("([^|]+)") do
+                        table.insert(parts, part:match("^%s*(.-)%s*$"))
+                    end
+                    if #parts >= 4 then
+                        local name = (parts[1] or ""):gsub("^%s*(.-)%s*$", "%1")
+                        local moneyStr = (parts[2] or ""):gsub("%*", ""):gsub("^%s*(.-)%s*$", "%1")
+                        local onlineStr = (parts[3] or ""):gsub("%*", ""):gsub("^%s*(.-)%s*$", "%1")
+                        local serverId = (parts[4] or ""):gsub("^%s*(.-)%s*$", "%1")
+                        
+                        -- Парсинг online (7/8, 6/8)
+                        local current, max = onlineStr:match("(%d+)/(%d+)")
+                        current = tonumber(current) or 0
+                        max = tonumber(max) or 8
+                        
+                        local moneyPerSec = parseMoneyPerSecond(moneyStr)
+                        
+                        if #name > 0 and #serverId > 0 then
+                            table.insert(servers, {
+                                name = name,
+                                moneyPerSec = moneyPerSec,
+                                online = current,
+                                maxOnline = max,
+                                serverId = serverId,
+                                onlineStr = onlineStr
+                            })
+                        end
+                    end
                 end
-            end
+            end)
         end
-    end
+    end)
     return servers
 end
 
@@ -380,23 +387,25 @@ end
 -- Фильтрация серверов
 local function filterServers(servers)
     local filtered = {}
+    if not servers or type(servers) ~= "table" then return filtered end
     for _, srv in ipairs(servers) do
-        -- Фильтр по Min M/S
-        if srv.moneyPerSec >= State.MinMS then
-            -- Фильтр по Ignore Names
-            local shouldIgnore = false
-            if State.IgnoreEnabled and #State.IgnoreNames > 0 then
-                for _, ignoreName in ipairs(State.IgnoreNames) do
-                    if srv.name:lower():find(ignoreName:lower(), 1, true) then
-                        shouldIgnore = true
-                        break
+        pcall(function()
+            if srv and srv.moneyPerSec and srv.moneyPerSec >= (State.MinMS or 0) then
+                -- Фильтр по Ignore Names
+                local shouldIgnore = false
+                if State.IgnoreEnabled and State.IgnoreNames and #State.IgnoreNames > 0 and srv.name then
+                    for _, ignoreName in ipairs(State.IgnoreNames) do
+                        if ignoreName and srv.name:lower():find(ignoreName:lower(), 1, true) then
+                            shouldIgnore = true
+                            break
+                        end
                     end
                 end
+                if not shouldIgnore then
+                    table.insert(filtered, srv)
+                end
             end
-            if not shouldIgnore then
-                table.insert(filtered, srv)
-            end
-        end
+        end)
     end
     return filtered
 end
@@ -414,96 +423,113 @@ end
 
 -- Создание карточки сервера
 local function createServerCard(server, parent, index)
-    local card = Instance.new("Frame")
-    card.Name = "ServerCard_" .. server.serverId
-    card.BackgroundColor3 = COLORS.surface2
-    card.BackgroundTransparency = ALPHA.card
-    card.Size = UDim2.new(1, -4, 0, 60)
-    card.LayoutOrder = index or 0
-    card.Parent = parent
-    roundify(card, 10)
-    stroke(card)
-    padding(card, 12, 8, 12, 8)
-    
-    -- Name
-    local nameLabel = mkLabel(card, server.name, 16, "medium", COLORS.textPrimary)
-    nameLabel.Size = UDim2.new(0.35, -4, 0, 20)
-    nameLabel.Position = UDim2.new(0, 0, 0, 0)
-    nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
-    
-    -- Money/Second
-    local moneyLabel = mkLabel(card, "$" .. formatMoney(server.moneyPerSec) .. "/s", 15, "medium", COLORS.joinBtn)
-    moneyLabel.Position = UDim2.new(0.35, 4, 0, 0)
-    moneyLabel.Size = UDim2.new(0.25, -4, 0, 20)
-    
-    -- Online
-    local onlineLabel = mkLabel(card, server.onlineStr, 15, "medium", COLORS.textWeak)
-    onlineLabel.Position = UDim2.new(0.6, 4, 0, 0)
-    onlineLabel.Size = UDim2.new(0.2, -88, 0, 20)
-    
-    -- Join Button
-    local joinBtn = Instance.new("TextButton")
-    joinBtn.Text = "JOIN"
-    joinBtn.TextSize = 14
-    joinBtn.Font = Enum.Font.GothamBold
-    joinBtn.TextColor3 = Color3.new(1, 1, 1)
-    joinBtn.BackgroundColor3 = COLORS.joinBtn
-    joinBtn.BackgroundTransparency = 0
-    joinBtn.Size = UDim2.new(0, 80, 0, 32)
-    joinBtn.Position = UDim2.new(1, -88, 0.5, -16)
-    joinBtn.AnchorPoint = Vector2.new(1, 0.5)
-    joinBtn.AutoButtonColor = false
-    joinBtn.Parent = card
-    roundify(joinBtn, 8)
-    
-    joinBtn.MouseButton1Click:Connect(function()
-        if not isJoining then
-            joinServer(server.serverId, State.JoinRetry)
-        end
+    if not server or not parent or not server.serverId then return nil end
+    local ok, card = pcall(function()
+        local card = Instance.new("Frame")
+        card.Name = "ServerCard_" .. (server.serverId or "unknown")
+        card.BackgroundColor3 = COLORS.surface2
+        card.BackgroundTransparency = ALPHA.card
+        card.Size = UDim2.new(1, -4, 0, 60)
+        card.LayoutOrder = index or 0
+        card.Parent = parent
+        roundify(card, 10)
+        stroke(card)
+        padding(card, 12, 8, 12, 8)
+        
+        -- Name
+        local nameLabel = mkLabel(card, server.name or "Unknown", 16, "medium", COLORS.textPrimary)
+        nameLabel.Size = UDim2.new(0.35, -4, 0, 20)
+        nameLabel.Position = UDim2.new(0, 0, 0, 0)
+        nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        
+        -- Money/Second
+        local moneyLabel = mkLabel(card, "$" .. formatMoney(server.moneyPerSec or 0) .. "/s", 15, "medium", COLORS.joinBtn)
+        moneyLabel.Position = UDim2.new(0.35, 4, 0, 0)
+        moneyLabel.Size = UDim2.new(0.25, -4, 0, 20)
+        
+        -- Online
+        local onlineLabel = mkLabel(card, server.onlineStr or "0/8", 15, "medium", COLORS.textWeak)
+        onlineLabel.Position = UDim2.new(0.6, 4, 0, 0)
+        onlineLabel.Size = UDim2.new(0.2, -88, 0, 20)
+        
+        -- Join Button
+        local joinBtn = Instance.new("TextButton")
+        joinBtn.Text = "JOIN"
+        joinBtn.TextSize = 14
+        joinBtn.Font = Enum.Font.GothamBold
+        joinBtn.TextColor3 = Color3.new(1, 1, 1)
+        joinBtn.BackgroundColor3 = COLORS.joinBtn
+        joinBtn.BackgroundTransparency = 0
+        joinBtn.Size = UDim2.new(0, 80, 0, 32)
+        joinBtn.Position = UDim2.new(1, -88, 0.5, -16)
+        joinBtn.AnchorPoint = Vector2.new(1, 0.5)
+        joinBtn.AutoButtonColor = false
+        joinBtn.Parent = card
+        roundify(joinBtn, 8)
+        
+        joinBtn.MouseButton1Click:Connect(function()
+            pcall(function()
+                if not isJoining and server.serverId then
+                    joinServer(server.serverId, State.JoinRetry)
+                end
+            end)
+        end)
+        
+        -- Hover эффект для кнопки
+        joinBtn.MouseEnter:Connect(function()
+            pcall(function()
+                TweenService:Create(joinBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(55, 242, 100)}):Play()
+            end)
+        end)
+        joinBtn.MouseLeave:Connect(function()
+            pcall(function()
+                TweenService:Create(joinBtn, TweenInfo.new(0.15), {BackgroundColor3 = COLORS.joinBtn}):Play()
+            end)
+        end)
+        
+        return card
     end)
-    
-    -- Hover эффект для кнопки
-    joinBtn.MouseEnter:Connect(function()
-        TweenService:Create(joinBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(55, 242, 100)}):Play()
-    end)
-    joinBtn.MouseLeave:Connect(function()
-        TweenService:Create(joinBtn, TweenInfo.new(0.15), {BackgroundColor3 = COLORS.joinBtn}):Play()
-    end)
-    
-    return card
+    return ok and card or nil
 end
 
 -- Обновление списка серверов
 local function updateServerList()
-    if not ServerListFrame then return end
-    
-    -- Очистка старых карточек
-    for _, child in ipairs(ServerListFrame:GetChildren()) do
-        if child:IsA("Frame") and child.Name:find("ServerCard_") then
-            child:Destroy()
+    local ok, err = pcall(function()
+        if not ServerListFrame then return end
+        
+        -- Очистка старых карточек
+        for _, child in ipairs(ServerListFrame:GetChildren()) do
+            if child:IsA("Frame") and child.Name:find("ServerCard_") then
+                pcall(function() child:Destroy() end)
+            end
         end
+        
+        -- Получение и фильтрация серверов
+        local allServers = fetchServerData()
+        local filtered = filterServers(allServers)
+        
+        -- Сортировка по moneyPerSec (по убыванию)
+        table.sort(filtered, function(a, b) return a.moneyPerSec > b.moneyPerSec end)
+        
+        -- Создание карточек
+        for i, server in ipairs(filtered) do
+            pcall(function() createServerCard(server, ServerListFrame, i) end)
+        end
+        
+        -- Обновление размера canvas будет через updateServerListCanvas
+        task.wait()
+        if updateServerListCanvas then
+            pcall(updateServerListCanvas)
+        end
+    end)
+    if not ok then
+        -- Тихая ошибка, не крашим скрипт
     end
-    
-    -- Получение и фильтрация серверов
-    local allServers = fetchServerData()
-    local filtered = filterServers(allServers)
-    
-    -- Сортировка по moneyPerSec (по убыванию)
-    table.sort(filtered, function(a, b) return a.moneyPerSec > b.moneyPerSec end)
-    
-    -- Создание карточек
-    for i, server in ipairs(filtered) do
-        createServerCard(server, ServerListFrame, i)
-    end
-    
-    -- Обновление размера canvas будет через updateServerListCanvas
-    task.wait()
-    updateServerListCanvas()
 end
 
 -- Join сервера с retry
 local function joinServer(serverId, maxRetries)
-    if isJoining then return end
+    if isJoining or not serverId or not player then return end
     isJoining = true
     currentJoinAttempts = 0
     maxRetries = maxRetries or State.JoinRetry
@@ -512,6 +538,7 @@ local function joinServer(serverId, maxRetries)
     local function attemptJoin()
         currentJoinAttempts = currentJoinAttempts + 1
         local ok, err = pcall(function()
+            if not player or not serverId then return end
             TeleportService:TeleportToPlaceInstance(game.PlaceId, serverId, player)
         end)
         
@@ -527,7 +554,7 @@ local function joinServer(serverId, maxRetries)
             -- Успешный вызов телепорта, ждём результата
             task.wait(3)
             -- Проверяем ошибку через lastTeleportError
-            if lastTeleportError:find("full") or lastTeleportError:find("GameFull") or lastTeleportError:find("Teleport failed") then
+            if lastTeleportError and (lastTeleportError:find("full") or lastTeleportError:find("GameFull") or lastTeleportError:find("Teleport failed")) then
                 if currentJoinAttempts < maxRetries then
                     lastTeleportError = ""
                     task.wait(1)
@@ -542,43 +569,58 @@ local function joinServer(serverId, maxRetries)
         end
     end
     
-    attemptJoin()
+    task.spawn(attemptJoin)
 end
 
 -- Auto Join логика
 local function checkAutoJoin()
-    if not State.AutoJoin or isJoining then return end
-    
-    local allServers = fetchServerData()
-    local filtered = filterServers(allServers)
-    
-    if #filtered > 0 then
-        -- Берём сервер с максимальным m/s
-        table.sort(filtered, function(a, b) return a.moneyPerSec > b.moneyPerSec end)
-        local bestServer = filtered[1]
-        joinServer(bestServer.serverId, State.JoinRetry)
+    local ok, err = pcall(function()
+        if not State.AutoJoin or isJoining then return end
+        
+        local allServers = fetchServerData()
+        local filtered = filterServers(allServers)
+        
+        if #filtered > 0 then
+            -- Берём сервер с максимальным m/s
+            table.sort(filtered, function(a, b) return a.moneyPerSec > b.moneyPerSec end)
+            local bestServer = filtered[1]
+            if bestServer and bestServer.serverId then
+                joinServer(bestServer.serverId, State.JoinRetry)
+            end
+        end
+    end)
+    if not ok then
+        -- Тихая ошибка
     end
 end
 
 -- Мониторинг ошибок телепорта
-if TeleportService.TeleportInitFailed then
-    TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
-        if player == Players.LocalPlayer then
-            lastTeleportError = errorMessage or tostring(teleportResult)
-        end
-    end)
-end
+pcall(function()
+    if TeleportService.TeleportInitFailed then
+        TeleportService.TeleportInitFailed:Connect(function(teleportPlayer, teleportResult, errorMessage)
+            pcall(function()
+                if teleportPlayer == player then
+                    lastTeleportError = errorMessage or tostring(teleportResult) or ""
+                end
+            end)
+        end)
+    end
+end)
 
 -- Мониторинг консоли для ошибок телепорта (резервный метод)
-if LogService and LogService.MessageOut then
-    LogService.MessageOut:Connect(function(message, messageType)
-        if messageType == Enum.MessageType.MessageOutput or messageType == Enum.MessageType.MessageError then
-            if message:find("Teleport failed") or message:find("GameFull") or message:find("full") or message:find("raiseTeleportInitFailedEvent") then
-                lastTeleportError = message
-            end
-        end
-    end)
-end
+pcall(function()
+    if LogService and LogService.MessageOut then
+        LogService.MessageOut:Connect(function(message, messageType)
+            pcall(function()
+                if messageType == Enum.MessageType.MessageOutput or messageType == Enum.MessageType.MessageError then
+                    if message and (message:find("Teleport failed") or message:find("GameFull") or message:find("full") or message:find("raiseTeleportInitFailedEvent")) then
+                        lastTeleportError = message
+                    end
+                end
+            end)
+        end)
+    end
+end)
 
 -- === Auto Inject (только очередь) ===
 local function pickQueue()
@@ -664,28 +706,43 @@ local function refreshUI()
 end
 
 task.defer(function()
-    updateLeftCanvas(); setVisible(true,true)
-    task.delay(0.05, refreshUI)
-    -- Первое обновление списка
-    updateServerList()
+    pcall(function()
+        updateLeftCanvas()
+        setVisible(true,true)
+        task.delay(0.05, function()
+            pcall(refreshUI)
+        end)
+        -- Первое обновление списка с задержкой
+        task.delay(0.5, function()
+            pcall(function()
+                if updateServerList then
+                    updateServerList()
+                end
+            end)
+        end)
+    end)
 end)
 
 -- Периодическое обновление списка серверов
 task.spawn(function()
     while true do
-        task.wait(UPDATE_INTERVAL)
-        if opened then
-            updateServerList()
-        end
+        pcall(function()
+            task.wait(UPDATE_INTERVAL)
+            if opened and updateServerList then
+                updateServerList()
+            end
+        end)
     end
 end)
 
 -- Периодическая проверка Auto Join
 task.spawn(function()
     while true do
-        task.wait(2)
-        if State.AutoJoin and not isJoining then
-            checkAutoJoin()
-        end
+        pcall(function()
+            task.wait(2)
+            if State.AutoJoin and not isJoining and checkAutoJoin then
+                checkAutoJoin()
+            end
+        end)
     end
 end)
