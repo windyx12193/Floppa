@@ -1,6 +1,6 @@
 --[[ Floppa Auto Joiner — Minimal UI (headless list) + Settings + Auto-Inject
      Goals:
-       • Tiny menu (~260x180), rounded corners
+       • Tiny menu (~260x190), rounded corners
        • Start/Stop Auto Join button
        • Min profit per second filter (in MILLIONS)
        • Settings persistence (JSON file)
@@ -61,7 +61,6 @@ local function pickQueue()
 end
 
 local function makeBootstrap()
-    -- Small bootstrap that fetches and runs the latest script from AUTO_INJECT_URL on the next server
     local src = [[
         task.spawn(function()
             if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end
@@ -84,7 +83,7 @@ local function queueReinject()
     if q then q(makeBootstrap()) end
 end
 
--- Always queue now and also when teleport starts
+-- queue bootstrap now and on teleport start
 queueReinject()
 Players.LocalPlayer.OnTeleport:Connect(function(st)
     if st == Enum.TeleportState.Started then
@@ -94,7 +93,7 @@ end)
 
 -- ========= Helpers =========
 local function parseMoneyStr(s)
-    s = tostring(s or ""):gsub(","," "):gsub(" ","") -- remove commas/spaces
+    s = tostring(s or ""):gsub(","," "):gsub(" ","")
     s = s:upper()
     local num, unit = s:match("%$%s*([%d%.]+)%s*([KMBT]?)%s*/%s*[Ss]")
     if not num then num, unit = s:match("%$%s*([%d%.]+)%s*([KMBT]?)") end
@@ -111,8 +110,13 @@ end
 
 local function parse_lines_payload(body)
     local items = {}
-    for line in tostring(body or ""):gmatch("[^
-]+") do
+    -- robust line splitting: handles 
+ and 
+; avoids raw newline in pattern
+    for line in (tostring(body or "") .. "
+"):gmatch("(.-)
+?
+") do
         local a,b,c,d = line:match("^%s*(.-)%s*|%s*(.-)%s*|%s*(.-)%s*|%s*(.-)%s*$")
         if a and b and c and d then
             local name = tostring(a)
@@ -187,7 +191,7 @@ local gui = Instance.new("ScreenGui"); gui.Name = "MiniAJGui"; gui.IgnoreGuiInse
 local frame = Instance.new("Frame"); frame.Name="Panel"; frame.Size = UDim2.new(0, 260, 0, 190); frame.Position = UDim2.new(0, 20, 0, 120); frame.BackgroundColor3 = COLORS.panel; frame.BackgroundTransparency = 0.08; frame.Parent = gui
 local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 14); c.Parent = frame
 local stroke = Instance.new("UIStroke"); stroke.Color = Color3.fromRGB(80,80,110); stroke.Thickness=1; stroke.Transparency=0.35; stroke.ApplyStrokeMode=Enum.ApplyStrokeMode.Border; stroke.Parent=frame
-local pad = Instance.new("UIPadding"); pad.PaddingLeft=UDim.new(0,10); pad.PaddingRight=UDim.new(0,10); pad.PaddingTop=UDim.new(0,10); pad.PaddingBottom=UDim2.new(0,10); pad.Parent=frame
+local pad = Instance.new("UIPadding"); pad.PaddingLeft=UDim.new(0,10); pad.PaddingRight=UDim.new(0,10); pad.PaddingTop=UDim.new(0,10); pad.PaddingBottom=UDim.new(0,10); pad.Parent=frame
 
 local function label(parent,text,size,bold)
     local l = Instance.new("TextLabel"); l.BackgroundTransparency=1; l.Text = text; l.TextColor3 = COLORS.text; l.TextSize = size or 16; l.TextXAlignment = Enum.TextXAlignment.Left
