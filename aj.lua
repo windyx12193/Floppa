@@ -8,7 +8,7 @@
   • Auto Join с retry функционалом
 ]]
 
-local SCRIPT_VERSION = "6.0"
+local SCRIPT_VERSION = "7.0"
 
 ------------------ USER SETTINGS ------------------
 local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
@@ -436,16 +436,6 @@ local function fetchServerData()
             end
         end
         
-        -- Способ 5: HttpService:GetAsync (если доступен)
-        if not responseBody and HttpService and HttpService.GetAsync then
-            local success, body = pcall(function()
-                return HttpService:GetAsync(API_URL, true)
-            end)
-            if success and body and type(body) == "string" and #body > 0 then
-                responseBody = body
-            end
-        end
-        
         return responseBody
     end)
     
@@ -572,78 +562,75 @@ end
 
 -- Обновление списка серверов
 local function updateServerList()
-    local ok, err = pcall(function()
-        -- Проверяем, что UI элементы созданы
-        if not ServerListFrame or not ServerListLayout then 
-            return 
-        end
-        
-        -- Очистка старых карточек
-        local children = ServerListFrame:GetChildren()
-        for _, child in ipairs(children) do
-            if child:IsA("Frame") and child.Name:find("ServerCard_") then
-                pcall(function() child:Destroy() end)
+    task.spawn(function()
+        local ok, err = pcall(function()
+            -- Проверяем, что UI элементы созданы
+            if not ServerListFrame or not ServerListLayout then 
+                return 
             end
-        end
-        
-        -- Получение данных с API (с повторными попытками)
-        local allServers = {}
-        for attempt = 1, 3 do
-            pcall(function()
-                local fetched = fetchServerData()
-                if fetched and type(fetched) == "table" and #fetched > 0 then
-                    allServers = fetched
-                    break
+            
+            -- Очистка старых карточек
+            local children = ServerListFrame:GetChildren()
+            for _, child in ipairs(children) do
+                if child:IsA("Frame") and child.Name:find("ServerCard_") then
+                    pcall(function() child:Destroy() end)
                 end
+            end
+            
+            -- Получение данных с API
+            local allServers = {}
+            local success, fetched = pcall(function()
+                return fetchServerData()
             end)
-            if #allServers > 0 then break end
-            if attempt < 3 then task.wait(0.5) end
-        end
-        
-        -- Если серверов нет, обновляем canvas и выходим
-        if not allServers or type(allServers) ~= "table" or #allServers == 0 then
-            task.wait(0.05)
+            if success and fetched and type(fetched) == "table" and #fetched > 0 then
+                allServers = fetched
+            end
+            
+            -- Если серверов нет, обновляем canvas и выходим
+            if not allServers or type(allServers) ~= "table" or #allServers == 0 then
+                task.wait(0.05)
+                if updateServerListCanvas then
+                    pcall(updateServerListCanvas)
+                end
+                return
+            end
+            
+            -- Фильтрация серверов
+            local filtered = {}
+            pcall(function()
+                filtered = filterServers(allServers)
+            end)
+            
+            if #filtered > 0 then
+                -- Сортировка по moneyPerSec (по убыванию)
+                pcall(function()
+                    table.sort(filtered, function(a, b) 
+                        return (a.moneyPerSec or 0) > (b.moneyPerSec or 0) 
+                    end)
+                end)
+                
+                -- Создание карточек
+                for i, server in ipairs(filtered) do
+                    if server and server.serverId and server.name then
+                        pcall(function() 
+                            local card = createServerCard(server, ServerListFrame, i)
+                        end)
+                        -- Небольшая задержка между созданием карточек
+                        task.wait(0.01)
+                    end
+                end
+            end
+            
+            -- Обновление размера canvas
+            task.wait(0.1)
             if updateServerListCanvas then
                 pcall(updateServerListCanvas)
             end
-            return
-        end
-        
-        -- Фильтрация серверов
-        local filtered = {}
-        pcall(function()
-            filtered = filterServers(allServers)
         end)
-        
-        if #filtered > 0 then
-            -- Сортировка по moneyPerSec (по убыванию)
-            pcall(function()
-                table.sort(filtered, function(a, b) 
-                    return (a.moneyPerSec or 0) > (b.moneyPerSec or 0) 
-                end)
-            end)
-            
-            -- Создание карточек
-            for i, server in ipairs(filtered) do
-                if server and server.serverId and server.name then
-                    pcall(function() 
-                        local card = createServerCard(server, ServerListFrame, i)
-                    end)
-                    -- Небольшая задержка между созданием карточек
-                    task.wait(0.01)
-                end
-            end
-        end
-        
-        -- Обновление размера canvas
-        task.wait(0.1)
-        if updateServerListCanvas then
-            pcall(updateServerListCanvas)
+        if not ok then
+            -- Тихая ошибка, не крашим скрипт
         end
     end)
-    if not ok then
-        -- Тихая ошибка, не крашим скрипт
-    end
 end
 
 -- Join сервера с retry
