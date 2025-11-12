@@ -1,985 +1,880 @@
---[[
-    Zamorozka Auto Joiner
-    Roblox Lua Script
-    
-    Features:
-    - Fetches server list from external API
-    - Auto Join with filters and retry support
-    - Auto Inject script on join
-    - Configurable filters (money, whitelist, blacklist)
-    - Real-time server updates with TTL
-    - Performance optimized with FPS throttling
-    
-    Usage:
-    1. Execute this script in your Roblox executor
-    2. Configure settings in the left panel
-    3. Enable Auto Join to automatically join suitable servers
-    4. Enable Auto Inject to auto-load script on join
-    
-    Config is saved to: zamorozka_config.json
---]]
+--[[ 
+  Zamorozka Auto Joiner  •  frosty UI + auto join/inject/retry
+  Author: @chatgpt12193 (Евгений Виндикс)
+
+  Data Source:
+    Endpoint: https://server-eta-two-29.vercel.app
+    API key:  autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja
+    Line formats supported:
+      "<name>  |  $22M/s  |  6/8  |  <uuid>  |  11.11.2025, 22:21:05"
+      "<name>  |  **$500K/s**  |  **6/8**  |  <uuid>  |  11.11.2025, 22:21:05"
+      (and numeric timestamp fallback)
+
+  Teleport:
+    game:GetService("TeleportService"):TeleportToPlaceInstance(109983668079237, "<JOB_ID>", game.Players.LocalPlayer)
+]]
+
+--============================[ Utility & Globals ]============================--
 
 local Players = game:GetService("Players")
-local TeleportService = game:GetService("TeleportService")
-local HttpService = game:GetService("HttpService")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 
-local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local LP = Players.LocalPlayer
 
--- Configuration
-local CONFIG = {
-    API_ENDPOINT = "https://server-eta-two-29.vercel.app",
-    API_KEY = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja",
-    PLACE_ID = 109983668079237,
-    INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/beta.lua",
-    POLL_RATE = 0.1, -- 10 Hz (100ms)
-    TTL = 180, -- seconds
-    NEW_BADGE_DURATION = 5, -- seconds
-    RETRY_RATE = 0.1, -- 100ms between retries
-    MAX_FRAME_TIME = 0.016, -- ~60 FPS threshold
+-- Safe request() wrapper for common executors
+local function get_request()
+    return (syn and syn.request) or (http and http.request) or request or (fluxus and fluxus.request) or nil
+end
+
+local http_request = get_request()
+if not http_request then
+    warn("[Zamorozka] This executor does not expose a request() function. Network fetch is required.")
+end
+
+-- FS helpers (executor filesystem)
+local function isfile_safe(p) local ok, r = pcall(function() return isfile and isfile(p) end) return ok and r end
+local function readfile_safe(p) local ok, r = pcall(function() return readfile(p) end) if ok then return r end end
+local function writefile_safe(p, d) pcall(function() if writefile then writefile(p, d) end end) end
+
+-- queue_on_teleport wrapper
+local function queue_on_teleport_safe(code)
+    if queue_on_teleport then queue_on_teleport(code)
+    elseif syn and syn.queue_on_teleport then syn.queue_on_teleport(code)
+    elseif fluxus and fluxus.queue_on_teleport then fluxus.queue_on_teleport(code)
+    end
+end
+
+-- UDim helpers
+local function px(x,y) return UDim2.new(0,x or 0,0,y or 0) end
+local function pxy(ax,pxl, ay,pyl) return UDim2.new(ax or 0, pxl or 0, ay or 0, pyl or 0) end
+
+-- Colors (icy theme)
+local col = {
+    bg = Color3.fromRGB(240, 244, 248),            -- light icy
+    panel = Color3.fromRGB(230, 236, 242),         -- slightly darker
+    glass = Color3.fromRGB(255, 255, 255),
+    text = Color3.fromRGB(20, 28, 38),
+    subtext = Color3.fromRGB(90, 100, 112),
+    green = Color3.fromRGB(30, 200, 90),
+    blue = Color3.fromRGB(60, 120, 220),
+    join = Color3.fromRGB(90, 230, 120),
+    danger = Color3.fromRGB(235, 75, 85),
+    new = Color3.fromRGB(255, 215, 0)
 }
 
--- State
-local state = {
-    servers = {}, -- {jobId: {name, moneyPerSec, players, maxPlayers, jobId, timestamp, order, ui}}
-    config = {
-        autoJoin = false,
-        autoInject = false,
-        moneyFilter = 0,
-        retryAmount = 0,
-        blacklist = {},
-        whitelist = {}
-    },
-    orderCounter = 0,
-    lastPollTime = 0,
-    lastFrameTime = 0,
-    retryAttempts = 0,
-    retryJobId = nil,
-    retryActive = false,
-    networkError = false,
-    currentJobId = nil,
-    uiVisible = true,
-    screenGui = nil,
+-- Config (persistent JSON)
+local CONFIG_PATH = "zamorozka_auto_joiner_config.json"
+local Config = {
+    autoJoin = false,
+    autoInject = false,
+    moneyFilter = 0,
+    retryAmount = 0,
+    blacklist = {},
+    whitelist = {},
 }
-
--- Utility Functions
-local function normalizeMoney(moneyStr)
-    if not moneyStr then return 0 end
-    -- Remove $, /s, spaces, and markdown markers
-    moneyStr = tostring(moneyStr):gsub("$", ""):gsub("/s", ""):gsub(" ", ""):gsub("%*", "")
-    
-    -- Extract number (supports decimals like 12.5)
-    local numStr = moneyStr:match("%d+%.?%d*")
-    if not numStr then return 0 end
-    
-    local num = tonumber(numStr)
-    if not num then return 0 end
-    
-    -- Extract suffix (K, M, B)
-    local suffix = moneyStr:match("[kmbKMB]")
-    if suffix then
-        suffix = suffix:lower()
-        if suffix == "k" then
-            return num * 1000
-        elseif suffix == "m" then
-            return num * 1000000
-        elseif suffix == "b" then
-            return num * 1000000000
+local function save_config()
+    writefile_safe(CONFIG_PATH, HttpService:JSONEncode(Config))
+end
+local function load_config()
+    local raw = readfile_safe(CONFIG_PATH)
+    if raw and #raw > 0 then
+        local ok, parsed = pcall(function() return HttpService:JSONDecode(raw) end)
+        if ok and type(parsed)=="table" then
+            Config.autoJoin = not not parsed.autoJoin
+            Config.autoInject = not not parsed.autoInject
+            Config.moneyFilter = tonumber(parsed.moneyFilter) or 0
+            Config.retryAmount = math.max(0, tonumber(parsed.retryAmount) or 0)
+            Config.blacklist = type(parsed.blacklist)=="table" and parsed.blacklist or {}
+            Config.whitelist = type(parsed.whitelist)=="table" and parsed.whitelist or {}
         end
+    else
+        save_config()
     end
-    
-    return num
+end
+load_config()
+
+-- CSV parsing -> array of trimmed strings
+local function parse_csv(s)
+    local t = {}
+    s = tostring(s or "")
+    for item in string.gmatch(s, "([^,]+)") do
+        local trimmed = string.gsub(item, "^%s*(.-)%s*$", "%1")
+        if #trimmed > 0 then table.insert(t, trimmed) end
+    end
+    return t
 end
 
-local function parseCSV(csvStr)
-    if not csvStr or csvStr == "" then return {} end
-    local result = {}
-    for item in csvStr:gmatch("([^,]+)") do
-        table.insert(result, item:match("^%s*(.-)%s*$"))
+-- Money normalizer: "200k" "8m" "1b" or plain numbers
+local suffix_factor = { k=1e3, K=1e3, m=1e6, M=1e6, b=1e9, B=1e9 }
+local function normalize_money(token)
+    if not token then return 0 end
+    token = tostring(token)
+    token = token:gsub("/s","")
+    local num, suf = token:match("^%s*([%d%.]+)%s*([kKmMbB]?)%s*$")
+    if not num then
+        local clean = token:gsub(",","")
+        local asnum = tonumber(clean)
+        return asnum or 0
     end
-    return result
+    local base = tonumber(num) or 0
+    local mul = suffix_factor[suf or ""] or 1
+    return math.floor(base * mul + 0.5)
 end
 
-local function parseTimestamp(dateTimeStr)
-    -- Parse format: "DD.MM.YYYY, HH:MM:SS" or "DD.MM.YYYY, HH:MM:SS"
-    -- Example: "11.11.2025, 22:21:05" or "12.11.2025, 17:07:43"
-    
-    if not dateTimeStr then return os.time() end
-    
-    -- Extract date and time parts
-    local datePart, timePart = dateTimeStr:match("([^,]+),%s*(.+)")
-    if not datePart or not timePart then
-        -- Try to parse as Unix timestamp
-        local ts = tonumber(dateTimeStr)
-        if ts then return ts end
-        return os.time() -- Fallback to current time
+-- number formatter (short)
+local function short_money(n)
+    if n >= 1e9 then return string.format("%.0fb/s", n/1e9)
+    elseif n >= 1e6 then return string.format("%.0fm/s", n/1e6)
+    elseif n >= 1e3 then return string.format("%.0fk/s", n/1e3)
+    else return string.format("%d/s", n)
     end
-    
-    -- Parse date: DD.MM.YYYY
-    local day, month, year = datePart:match("(%d+)%.(%d+)%.(%d+)")
-    if not day or not month or not year then
-        return os.time()
-    end
-    
-    -- Parse time: HH:MM:SS
-    local hour, minute, second = timePart:match("(%d+):(%d+):(%d+)")
-    if not hour or not minute or not second then
-        return os.time()
-    end
-    
-    -- Convert to Unix timestamp
-    -- Note: os.time expects {year, month, day, hour, min, sec}
-    local success, timestamp = pcall(function()
-        return os.time({
-            year = tonumber(year),
-            month = tonumber(month),
-            day = tonumber(day),
-            hour = tonumber(hour),
-            min = tonumber(minute),
-            sec = tonumber(second)
-        })
+end
+
+--============================[ UI Construction ]============================--
+
+-- Root gui (CoreGui to avoid being parented into character reset)
+local RootGui = Instance.new("ScreenGui")
+RootGui.Name = "ZamorozkaAutoJoiner"
+RootGui.ResetOnSpawn = false
+RootGui.IgnoreGuiInset = true
+RootGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+RootGui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+-- Blur (subtle, performance-friendly)
+local blur = Instance.new("BlurEffect")
+blur.Name = "ZamorozkaBlur"
+blur.Size = 0 -- off by default, we toggle to 4 on show
+blur.Parent = workspace.CurrentCamera
+
+-- Main container
+local Main = Instance.new("Frame")
+Main.Name = "Main"
+Main.Size = UDim2.new(0.9,0,0.9,0)
+Main.Position = UDim2.new(0.05,0,0.05,0)
+Main.BackgroundColor3 = col.bg
+Main.BackgroundTransparency = 0.1
+Main.BorderSizePixel = 0
+Main.Parent = RootGui
+local uic = Instance.new("UICorner", Main); uic.CornerRadius = UDim.new(0,16)
+local uiStroke = Instance.new("UIStroke", Main); uiStroke.Color = Color3.fromRGB(220, 228, 235); uiStroke.Thickness = 1
+
+-- Top bar
+local Top = Instance.new("Frame")
+Top.Name = "TopBar"
+Top.Size = UDim2.new(1,0,0.12,0)
+Top.BackgroundColor3 = col.panel
+Top.BackgroundTransparency = 0.15
+Top.BorderSizePixel = 0
+Top.Parent = Main
+Instance.new("UICorner", Top).CornerRadius = UDim.new(0,16)
+
+local Title = Instance.new("TextLabel")
+Title.Name = "Title"
+Title.BackgroundTransparency = 1
+Title.Text = "Zamorozka Auto Joiner"
+Title.Font = Enum.Font.GothamBlack
+Title.TextScaled = true
+Title.TextColor3 = col.text
+Title.Size = UDim2.new(0.65,0,1,0)
+Title.Position = UDim2.new(0.02,0,0,0)
+Title.Parent = Top
+
+-- Error banner (non-blocking)
+local Banner = Instance.new("TextLabel")
+Banner.Name = "Banner"
+Banner.BackgroundTransparency = 0.35
+Banner.BackgroundColor3 = col.danger
+Banner.TextColor3 = Color3.fromRGB(255,255,255)
+Banner.Font = Enum.Font.GothamBold
+Banner.TextScaled = true
+Banner.Text = ""
+Banner.Visible = false
+Banner.Size = UDim2.new(0.33,0,0.6,0)
+Banner.Position = UDim2.new(0.66,0,0.2,0)
+Banner.Parent = Top
+Instance.new("UICorner", Banner).CornerRadius = UDim.new(0,12)
+
+local function show_banner(msg, dur)
+    Banner.Text = msg
+    Banner.Visible = true
+    TweenService:Create(Banner, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency=0.15}):Play()
+    task.delay(dur or 2.5, function()
+        TweenService:Create(Banner, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency=0.45}):Play()
+        task.wait(0.26)
+        Banner.Visible = false
     end)
-    
-    if success and timestamp then
-        return timestamp
-    end
-    
-    return os.time() -- Fallback
 end
 
-local function parseServerLine(line)
-    -- Support formats:
-    -- "<name> | $<money>/s | <players>/<max> | <jobId> | DD.MM.YYYY, HH:MM:SS"
-    -- "<name> | **$<money>/s** | **<players>/<max>** | <jobId> | DD.MM.YYYY, HH:MM:SS"
-    -- Examples:
-    -- "Los Mobilis  |  $22M/s  |  6/8  |  31915a24-d258-4a8c-9ddb-e669b59b3b08   | 11.11.2025, 22:21:05"
-    -- "Vulturino Skeletono  |  **$500K/s**  |  **6/8**  |  f4cbec62-f91e-45e1-99e3-a2809e975e3d   | 11.11.2025, 21:34:01"
-    
-    if not line or line == "" then return nil end
-    
-    -- Remove markdown bold markers
-    line = line:gsub("%*%*", "")
-    
-    local parts = {}
-    for part in line:gmatch("([^|]+)") do
-        table.insert(parts, part:match("^%s*(.-)%s*$"))
+-- Left panel (settings)
+local Left = Instance.new("Frame")
+Left.Name = "Left"
+Left.Size = UDim2.new(0.32,0,0.86,0)
+Left.Position = UDim2.new(0.02,0,0.12,0)
+Left.BackgroundColor3 = col.panel
+Left.BackgroundTransparency = 0.2
+Left.BorderSizePixel = 0
+Left.Parent = Main
+Instance.new("UICorner", Left).CornerRadius = UDim.new(0,16)
+Instance.new("UIStroke", Left).Color = Color3.fromRGB(220, 228, 235)
+
+local SettingsTitle = Instance.new("TextLabel")
+SettingsTitle.BackgroundTransparency = 1
+SettingsTitle.Text = "Settings"
+SettingsTitle.Font = Enum.Font.GothamBlack
+SettingsTitle.TextScaled = true
+SettingsTitle.TextColor3 = col.text
+SettingsTitle.Size = UDim2.new(1, -20, 0, 36)
+SettingsTitle.Position = UDim2.new(0,10, 0,10)
+SettingsTitle.Parent = Left
+
+local SettingsScroll = Instance.new("ScrollingFrame")
+SettingsScroll.BackgroundTransparency = 1
+SettingsScroll.Size = UDim2.new(1,-20, 1,-56)
+SettingsScroll.Position = UDim2.new(0,10, 0,50)
+SettingsScroll.ScrollBarThickness = 4
+SettingsScroll.Parent = Left
+local SettingsLayout = Instance.new("UIListLayout", SettingsScroll)
+SettingsLayout.Padding = UDim.new(0,10)
+
+local function add_section_label(text)
+    local lab = Instance.new("TextLabel")
+    lab.BackgroundTransparency = 1
+    lab.TextXAlignment = Enum.TextXAlignment.Left
+    lab.Font = Enum.Font.GothamBold
+    lab.TextScaled = true
+    lab.TextColor3 = col.subtext
+    lab.Text = text
+    lab.Size = UDim2.new(1,0,0,26)
+    lab.Parent = SettingsScroll
+end
+
+local function make_toggle(labelText, init, callback)
+    local holder = Instance.new("Frame")
+    holder.Size = UDim2.new(1,0,0,40)
+    holder.BackgroundTransparency = 1
+    holder.Parent = SettingsScroll
+
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Font = Enum.Font.Gotham
+    l.TextScaled = true
+    l.TextColor3 = col.text
+    l.Text = labelText
+    l.Size = UDim2.new(0.7,0,1,0)
+    l.Parent = holder
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.25,0,1,0)
+    btn.Position = UDim2.new(0.73,0,0,0)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextScaled = true
+    btn.TextColor3 = Color3.fromRGB(255,255,255)
+    btn.Text = init and "ON" or "OFF"
+    btn.BackgroundColor3 = init and col.green or Color3.fromRGB(160,165,170)
+    btn.AutoButtonColor = false
+    btn.Parent = holder
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0,10)
+
+    btn.MouseButton1Click:Connect(function()
+        init = not init
+        btn.Text = init and "ON" or "OFF"
+        TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = init and col.green or Color3.fromRGB(160,165,170)}):Play()
+        callback(init)
+    end)
+end
+
+local function make_textbox(labelText, placeholder, init, callback)
+    local holder = Instance.new("Frame")
+    holder.Size = UDim2.new(1,0,0,50)
+    holder.BackgroundTransparency = 1
+    holder.Parent = SettingsScroll
+
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Font = Enum.Font.Gotham
+    l.TextScaled = true
+    l.TextColor3 = col.text
+    l.Text = labelText
+    l.Size = UDim2.new(1,0,0,20)
+    l.Parent = holder
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1,0,0,28)
+    box.Position = UDim2.new(0,0,0,22)
+    box.Font = Enum.Font.Gotham
+    box.TextScaled = true
+    box.PlaceholderText = placeholder
+    box.Text = init or ""
+    box.BackgroundColor3 = col.glass
+    box.TextColor3 = col.text
+    box.ClearTextOnFocus = false
+    box.Parent = holder
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0,8)
+    Instance.new("UIStroke", box).Color = Color3.fromRGB(210,220,230)
+
+    box.FocusLost:Connect(function()
+        callback(box.Text)
+    end)
+end
+
+-- Right panel (server list)
+local Right = Instance.new("Frame")
+Right.Name = "Right"
+Right.Size = UDim2.new(0.64,0,0.86,0)
+Right.Position = UDim2.new(0.34,0,0.12,0)
+Right.BackgroundColor3 = col.panel
+Right.BackgroundTransparency = 0.15
+Right.BorderSizePixel = 0
+Right.Parent = Main
+Instance.new("UICorner", Right).CornerRadius = UDim.new(0,16)
+Instance.new("UIStroke", Right).Color = Color3.fromRGB(220, 228, 235)
+
+local List = Instance.new("ScrollingFrame")
+List.Name = "List"
+List.BackgroundTransparency = 1
+List.Size = UDim2.new(1,-20, 1,-20)
+List.Position = UDim2.new(0,10,0,10)
+List.ScrollBarThickness = 6
+List.Parent = Right
+local ListLayout = Instance.new("UIListLayout", List)
+ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ListLayout.Padding = UDim.new(0,8)
+
+-- server card factory
+local function make_card()
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, -8, 0, 44)
+    f.BackgroundColor3 = col.glass
+    f.BackgroundTransparency = 0.1
+    f.BorderSizePixel = 0
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0,10)
+    local stroke = Instance.new("UIStroke", f); stroke.Color = Color3.fromRGB(210,220,230)
+
+    local name = Instance.new("TextLabel")
+    name.Name = "Name"
+    name.BackgroundTransparency = 1
+    name.TextXAlignment = Enum.TextXAlignment.Left
+    name.Text = ""
+    name.Font = Enum.Font.GothamBold
+    name.TextScaled = true
+    name.TextColor3 = col.text
+    name.Size = UDim2.new(0.42,0,1,0)
+    name.Position = UDim2.new(0.02,0,0,0)
+    name.Parent = f
+
+    local money = Instance.new("TextLabel")
+    money.Name = "Money"
+    money.BackgroundTransparency = 1
+    money.TextXAlignment = Enum.TextXAlignment.Left
+    money.Text = ""
+    money.Font = Enum.Font.GothamBold
+    money.TextScaled = true
+    money.TextColor3 = col.green
+    money.Size = UDim2.new(0.18,0,1,0)
+    money.Position = UDim2.new(0.45,0,0,0)
+    money.Parent = f
+
+    local ppl = Instance.new("TextLabel")
+    ppl.Name = "Players"
+    ppl.BackgroundTransparency = 1
+    ppl.TextXAlignment = Enum.TextXAlignment.Left
+    ppl.Text = ""
+    ppl.Font = Enum.Font.GothamBold
+    ppl.TextScaled = true
+    ppl.TextColor3 = col.blue
+    ppl.Size = UDim2.new(0.12,0,1,0)
+    ppl.Position = UDim2.new(0.62,0,0,0)
+    ppl.Parent = f
+
+    local newb = Instance.new("TextLabel")
+    newb.Name = "NewBadge"
+    newb.BackgroundTransparency = 0.2
+    newb.BackgroundColor3 = col.new
+    newb.Text = "NEW"
+    newb.Font = Enum.Font.GothamBlack
+    newb.TextScaled = true
+    newb.TextColor3 = Color3.fromRGB(20,20,20)
+    newb.Size = UDim2.new(0, 56, 0, 24)
+    newb.Position = UDim2.new(0.76,0,0.22,0)
+    newb.Visible = false
+    newb.Parent = f
+    Instance.new("UICorner", newb).CornerRadius = UDim.new(0,8)
+
+    local join = Instance.new("TextButton")
+    join.Name = "Join"
+    join.Text = "JOIN"
+    join.Font = Enum.Font.GothamBlack
+    join.TextScaled = true
+    join.TextColor3 = Color3.fromRGB(20,30,20)
+    join.AutoButtonColor = false
+    join.Size = UDim2.new(0.18, -8, 0.8, 0)
+    join.Position = UDim2.new(0.82, 0, 0.1, 0)
+    join.BackgroundColor3 = col.join
+    join.Parent = f
+    Instance.new("UICorner", join).CornerRadius = UDim.new(0,10)
+    Instance.new("UIStroke", join).Color = Color3.fromRGB(180,210,190)
+
+    return f
+end
+
+--============================[ Data & State ]============================--
+
+local ENDPOINT = "https://server-eta-two-29.vercel.app"
+local API_KEY = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
+local PLACE_ID = 109983668079237
+
+-- jobId -> entry
+local entries = {}
+-- appearance order & time for NEW badge
+local appearTimes = {} -- jobId -> tick()
+-- card pool
+local cardByJob = {}
+local cardPool = {}
+
+-- adaptive polling / UI tick
+local pollInterval = 0.15 -- 5–10 Hz target
+local minInterval, maxInterval = 0.1, 1.5
+local backoff = 0 -- ms extra throttle on errors
+local lastFPSCheck = tick()
+local avgDt = 1/60
+
+--============================[ Filters & Toggles ]============================--
+
+local function set_money_filter(s)
+    local v = tonumber(s)
+    if not v then
+        v = normalize_money((s or ""):gsub("/s",""))
     end
-    
+    v = math.max(0, v or 0)
+    Config.moneyFilter = v
+    save_config()
+end
+
+local function set_retry_amount(s)
+    local n = tonumber(s) or 0
+    if n < 0 then
+        n = 0
+        show_banner("Retry amount can't be negative. Clamped to 0.", 2.2)
+    end
+    Config.retryAmount = math.floor(n)
+    save_config()
+end
+
+local function set_whitelist(s)
+    Config.whitelist = parse_csv(s)
+    save_config()
+end
+local function set_blacklist(s)
+    Config.blacklist = parse_csv(s)
+    save_config()
+end
+
+-- initial UI controls
+add_section_label("Toggles")
+make_toggle("Auto Join", Config.autoJoin, function(v)
+    Config.autoJoin = v; save_config()
+end)
+make_toggle("Auto Inject", Config.autoInject, function(v)
+    Config.autoInject = v; save_config()
+end)
+
+add_section_label("Filters")
+make_textbox("Money filter (m/s)", "e.g., 200k / 8m / 1b", (Config.moneyFilter>0) and (short_money(Config.moneyFilter):gsub("/s","")) or "", function(txt)
+    set_money_filter(txt)
+end)
+make_textbox("Join retry amount", "0 = off", tostring(Config.retryAmount or 0), function(txt)
+    set_retry_amount(txt)
+end)
+make_textbox("Whitelist (CSV)", "name1,name2,…", table.concat(Config.whitelist, ","), function(txt)
+    set_whitelist(txt)
+end)
+make_textbox("Blacklist (CSV)", "nameA,nameB,…", table.concat(Config.blacklist, ","), function(txt)
+    set_blacklist(txt)
+end)
+
+--============================[ Networking ]============================--
+
+local function fetch_lines()
+    if not http_request then return nil, "request() not available" end
+    local res = http_request({
+        Url = ENDPOINT,
+        Method = "GET",
+        Headers = {
+            ["x-api-key"] = API_KEY,
+            ["Authorization"] = "Bearer "..API_KEY,
+            ["Accept"] = "text/plain",
+        }
+    })
+    if not res or (res.StatusCode or 0) >= 400 then
+        return nil, ("HTTP error %s"):format(res and res.StatusCode or "nil")
+    end
+    local body = res.Body or res.body or ""
+    local lines = {}
+    for ln in body:gmatch("([^\r\n]+)") do table.insert(lines, ln) end
+    return lines
+end
+
+--============================[ Line Parsing (UPDATED) ]============================--
+
+-- "<name> |  $22M/s  |  6/8  |  <uuid>  |  11.11.2025, 22:21:05"
+local function parse_line(line)
+    if not line or #line < 5 then return nil end
+
+    -- strip markdown bold & $ signs, normalize spaces
+    local cleaned = line:gsub("%*%*", ""):gsub("%$","")
+    local parts = {}
+    for part in cleaned:gmatch("([^|]+)") do
+        table.insert(parts, (part:gsub("^%s*(.-)%s*$","%1")))
+    end
     if #parts < 5 then return nil end
-    
-    local name = parts[1]
-    local moneyStr = parts[2]
-    local playersStr = parts[3]
-    local jobId = parts[4]:match("^%s*(.-)%s*$") -- Trim whitespace
-    local timestampStr = parts[5]
-    
-    if not name or not jobId or name == "" or jobId == "" then return nil end
-    
-    -- Parse money (handle formats like "$22M/s", "$12.5M/s", "$500K/s")
-    local moneyPerSec = normalizeMoney(moneyStr)
-    
-    -- Parse players (handle formats like "6/8", "**6/8**")
-    local players, maxPlayers = playersStr:match("(%d+)/(%d+)")
-    players = tonumber(players) or 0
-    maxPlayers = tonumber(maxPlayers) or 0
-    
-    -- Parse timestamp
-    local timestamp = parseTimestamp(timestampStr)
-    
+
+    local name        = parts[1]
+    local mps_raw     = parts[2]            -- e.g. "22M/s" or "500K/s"
+    local players_raw = parts[3]            -- e.g. "6/8"
+    local jobId       = parts[4]
+    local ts_raw      = parts[5]            -- e.g. "11.11.2025, 22:21:05" (dd.mm.yyyy, HH:MM:SS)
+
+    local mps = normalize_money(mps_raw)
+
+    local p, maxp = players_raw:match("^(%d+)%s*/%s*(%d+)$")
+    p, maxp = tonumber(p or 0) or 0, tonumber(maxp or 0) or 0
+
+    -- try human-readable date first
+    local d, mo, y, hh, mm, ss = ts_raw:match("^(%d%d)%.(%d%d)%.(%d%d%d%d),%s*(%d%d):(%d%d):(%d%d)$")
+    local ts_num = 0
+    if d and mo and y and hh and mm and ss then
+        ts_num = os.time({
+            year  = tonumber(y),
+            month = tonumber(mo),
+            day   = tonumber(d),
+            hour  = tonumber(hh),
+            min   = tonumber(mm),
+            sec   = tonumber(ss)
+        }) or 0
+    else
+        -- fallback: support numeric timestamps if the endpoint ever sends them
+        ts_num = tonumber(ts_raw) or 0
+    end
+
+    if not (jobId and #jobId > 15) then return nil end
+
     return {
-        name = name,
-        moneyPerSec = moneyPerSec,
-        players = players,
-        maxPlayers = maxPlayers,
+        name = tostring(name or ""),
+        moneyPerSec = mps,
+        players = p,
+        maxPlayers = maxp,
         jobId = jobId,
-        timestamp = timestamp
+        timestamp = ts_num,  -- epoch seconds (local time zone)
     }
 end
 
--- Config Storage
-local function getConfigPath()
-    -- Try to use executor's filesystem
-    local success, path = pcall(function()
-        return readfile and readfile("zamorozka_config.json") or nil
+--============================[ Join / Retry / Inject ]============================--
+
+local AutoJoinInProgress = false
+
+local function perform_teleport(jobId)
+    if not jobId then return false end
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(PLACE_ID, jobId, LP)
     end)
-    return "zamorozka_config.json"
+    if ok then
+        return true
+    else
+        warn("[Zamorozka] Teleport failed: "..tostring(err))
+        return false
+    end
 end
 
-local function loadConfig()
-    local success, content = pcall(function()
-        if readfile then
-            return readfile(getConfigPath())
-        end
-        return nil
-    end)
-    
-    if success and content then
-        local success2, config = pcall(function()
-            return HttpService:JSONDecode(content)
-        end)
-        if success2 and config then
-            state.config = config
-            -- Ensure arrays exist
-            state.config.blacklist = state.config.blacklist or {}
-            state.config.whitelist = state.config.whitelist or {}
+local function join_with_retry(jobId, maxAttempts)
+    if (maxAttempts or 0) <= 0 then
+        return perform_teleport(jobId)
+    end
+    for i=1, maxAttempts do
+        print(string.format("[Zamorozka] join retry %d/%d", i, maxAttempts))
+        if perform_teleport(jobId) then
             return true
         end
+        task.wait(0.10) -- 10 attempts/sec
     end
     return false
 end
 
-local function saveConfig()
-    local success, json = pcall(function()
-        return HttpService:JSONEncode(state.config)
-    end)
-    
-    if success and json and writefile then
-        pcall(function()
-            writefile(getConfigPath(), json)
-        end)
-    end
+local function prepare_auto_inject_on_teleport()
+    if not Config.autoInject then return end
+    local remote = "https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/beta.lua"
+    local code = ([[
+        local function fetch(u)
+            local req = (syn and syn.request) or (http and http.request) or request or (fluxus and fluxus.request)
+            local r = req and req({Url=u, Method="GET"}) or nil
+            return r and (r.Body or r.body) or ""
+        end
+        local src = fetch("%s")
+        if src and #src > 0 then
+            local ok, err = pcall(function() loadstring(src)() end)
+            if not ok then warn("[Zamorozka][AutoInject] failed: "..tostring(err)) end
+        end
+    ]]):format(remote)
+    queue_on_teleport_safe(code)
 end
 
--- UI Creation
-local function createUI()
-    local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "ZamorozkaAutoJoiner"
-    screenGui.ResetOnSpawn = false
-    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    screenGui.Parent = PlayerGui
-    
-    -- Main Container
-    local mainFrame = Instance.new("Frame")
-    mainFrame.Name = "MainFrame"
-    mainFrame.Size = UDim2.new(0.9, 0, 0.85, 0)
-    mainFrame.Position = UDim2.new(0.05, 0, 0.075, 0)
-    mainFrame.BackgroundColor3 = Color3.fromRGB(240, 248, 255) -- Light icy blue
-    mainFrame.BackgroundTransparency = 0.15
-    mainFrame.BorderSizePixel = 0
-    mainFrame.Parent = screenGui
-    
-    -- Blur effect (light)
-    local blur = Instance.new("BlurEffect")
-    blur.Size = 2
-    blur.Parent = mainFrame
-    
-    -- Top Bar
-    local topBar = Instance.new("Frame")
-    topBar.Name = "TopBar"
-    topBar.Size = UDim2.new(1, 0, 0.12, 0)
-    topBar.Position = UDim2.new(0, 0, 0, 0)
-    topBar.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    topBar.BackgroundTransparency = 0.1
-    topBar.BorderSizePixel = 0
-    topBar.Parent = mainFrame
-    
-    local title = Instance.new("TextLabel")
-    title.Name = "Title"
-    title.Size = UDim2.new(1, 0, 1, 0)
-    title.Position = UDim2.new(0, 0, 0, 0)
-    title.BackgroundTransparency = 1
-    title.Text = "ZAMOROZKA AUTO JOINER"
-    title.TextColor3 = Color3.fromRGB(0, 0, 0)
-    title.TextSize = 32
-    title.Font = Enum.Font.GothamBold
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Padding = Instance.new("UIPadding")
-    title.Padding.PaddingLeft = UDim.new(0, 20)
-    title.Parent = topBar
-    
-    -- Error Banner
-    local errorBanner = Instance.new("TextLabel")
-    errorBanner.Name = "ErrorBanner"
-    errorBanner.Size = UDim2.new(1, 0, 0.08, 0)
-    errorBanner.Position = UDim2.new(0, 0, 0.12, 0)
-    errorBanner.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
-    errorBanner.BackgroundTransparency = 0.2
-    errorBanner.BorderSizePixel = 0
-    errorBanner.Text = "Network Error - Retrying..."
-    errorBanner.TextColor3 = Color3.fromRGB(255, 255, 255)
-    errorBanner.TextSize = 18
-    errorBanner.Font = Enum.Font.GothamBold
-    errorBanner.Visible = false
-    errorBanner.Parent = mainFrame
-    
-    -- Content Container
-    local contentFrame = Instance.new("Frame")
-    contentFrame.Name = "ContentFrame"
-    contentFrame.Size = UDim2.new(1, 0, 0.8, 0)
-    contentFrame.Position = UDim2.new(0, 0, 0.2, 0)
-    contentFrame.BackgroundTransparency = 1
-    contentFrame.BorderSizePixel = 0
-    contentFrame.Parent = mainFrame
-    
-    -- Left Panel (Settings)
-    local leftPanel = Instance.new("ScrollingFrame")
-    leftPanel.Name = "LeftPanel"
-    leftPanel.Size = UDim2.new(0.25, 0, 1, 0)
-    leftPanel.Position = UDim2.new(0, 0, 0, 0)
-    leftPanel.BackgroundColor3 = Color3.fromRGB(200, 220, 240)
-    leftPanel.BackgroundTransparency = 0.2
-    leftPanel.BorderSizePixel = 0
-    leftPanel.ScrollBarThickness = 6
-    leftPanel.CanvasSize = UDim2.new(0, 0, 0, 0)
-    leftPanel.Parent = contentFrame
-    
-    local leftLayout = Instance.new("UIListLayout")
-    leftLayout.Padding = UDim.new(0, 10)
-    leftLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    leftLayout.Parent = leftPanel
-    
-    -- Right Panel (Server List)
-    local rightPanel = Instance.new("ScrollingFrame")
-    rightPanel.Name = "RightPanel"
-    rightPanel.Size = UDim2.new(0.75, 0, 1, 0)
-    rightPanel.Position = UDim2.new(0.25, 0, 0, 0)
-    rightPanel.BackgroundColor3 = Color3.fromRGB(250, 250, 255)
-    rightPanel.BackgroundTransparency = 0.1
-    rightPanel.BorderSizePixel = 0
-    rightPanel.ScrollBarThickness = 6
-    rightPanel.CanvasSize = UDim2.new(0, 0, 0, 0)
-    rightPanel.Parent = contentFrame
-    
-    local rightLayout = Instance.new("UIListLayout")
-    rightLayout.Padding = UDim.new(0, 8)
-    rightLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    rightLayout.Parent = rightPanel
-    
-    -- Settings UI Elements
-    local toggleButtons = {}
-    local function createToggle(name, key, yPos)
-        local toggleFrame = Instance.new("Frame")
-        toggleFrame.Name = name .. "Toggle"
-        toggleFrame.Size = UDim2.new(0.9, 0, 0, 50)
-        toggleFrame.Position = UDim2.new(0.05, 0, 0, yPos)
-        toggleFrame.BackgroundTransparency = 1
-        toggleFrame.LayoutOrder = yPos
-        toggleFrame.Parent = leftPanel
-        
-        local label = Instance.new("TextLabel")
-        label.Name = "Label"
-        label.Size = UDim2.new(0.6, 0, 1, 0)
-        label.Position = UDim2.new(0, 0, 0, 0)
-        label.BackgroundTransparency = 1
-        label.Text = name
-        label.TextColor3 = Color3.fromRGB(0, 0, 0)
-        label.TextSize = 18
-        label.Font = Enum.Font.GothamBold
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.Parent = toggleFrame
-        
-        local toggleButton = Instance.new("TextButton")
-        toggleButton.Name = "Toggle"
-        toggleButton.Size = UDim2.new(0.35, 0, 0.7, 0)
-        toggleButton.Position = UDim2.new(0.6, 0, 0.15, 0)
-        toggleButton.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
-        toggleButton.BorderSizePixel = 0
-        toggleButton.Text = "OFF"
-        toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-        toggleButton.TextSize = 16
-        toggleButton.Font = Enum.Font.GothamBold
-        toggleButton.Parent = toggleFrame
-        
-        toggleButton.MouseButton1Click:Connect(function()
-            state.config[key] = not state.config[key]
-            saveConfig()
-            updateToggleUI(toggleButton, state.config[key])
-        end)
-        
-        toggleButtons[key] = toggleButton
-        updateToggleUI(toggleButton, state.config[key])
-        return toggleFrame
-    end
-    
-    local function createInput(name, key, yPos, isNumber)
-        local inputFrame = Instance.new("Frame")
-        inputFrame.Name = name .. "Input"
-        inputFrame.Size = UDim2.new(0.9, 0, 0, 60)
-        inputFrame.Position = UDim2.new(0.05, 0, 0, yPos)
-        inputFrame.BackgroundTransparency = 1
-        inputFrame.LayoutOrder = yPos
-        inputFrame.Parent = leftPanel
-        
-        local label = Instance.new("TextLabel")
-        label.Name = "Label"
-        label.Size = UDim2.new(1, 0, 0.4, 0)
-        label.Position = UDim2.new(0, 0, 0, 0)
-        label.BackgroundTransparency = 1
-        label.Text = name
-        label.TextColor3 = Color3.fromRGB(0, 0, 0)
-        label.TextSize = 16
-        label.Font = Enum.Font.GothamBold
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.Parent = inputFrame
-        
-        local textBox = Instance.new("TextBox")
-        textBox.Name = "Input"
-        textBox.Size = UDim2.new(1, 0, 0.55, 0)
-        textBox.Position = UDim2.new(0, 0, 0.45, 0)
-        textBox.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-        textBox.BackgroundTransparency = 0.3
-        textBox.BorderSizePixel = 0
-        textBox.Text = isNumber and tostring(state.config[key] or 0) or table.concat(state.config[key] or {}, ",")
-        textBox.TextColor3 = Color3.fromRGB(0, 0, 0)
-        textBox.TextSize = 14
-        textBox.Font = Enum.Font.Gotham
-        textBox.PlaceholderText = isNumber and "0" or "name1,name2,..."
-        textBox.Parent = inputFrame
-        
-        textBox.FocusLost:Connect(function()
-            if isNumber then
-                local num = tonumber(textBox.Text) or 0
-                if num < 0 then
-                    num = 0
-                    textBox.Text = "0"
-                end
-                state.config[key] = num
-            else
-                state.config[key] = parseCSV(textBox.Text)
-            end
-            saveConfig()
-        end)
-        
-        return inputFrame
-    end
-    
-    local yPos = 0
-    createToggle("Auto Join", "autoJoin", yPos)
-    yPos = yPos + 60
-    createToggle("Auto Inject", "autoInject", yPos)
-    yPos = yPos + 70
-    createInput("Money Filter (m/s)", "moneyFilter", yPos, true)
-    yPos = yPos + 70
-    createInput("Join Retry Amount", "retryAmount", yPos, true)
-    yPos = yPos + 70
-    createInput("Whitelist (CSV)", "whitelist", yPos, false)
-    yPos = yPos + 70
-    createInput("Blacklist (CSV)", "blacklist", yPos, false)
-    
-    -- Update canvas size
-    leftPanel.CanvasSize = UDim2.new(0, 0, 0, yPos + 70)
-    
-    return screenGui, leftPanel, rightPanel, errorBanner
-end
+--============================[ Filtering / Sorting ]============================--
 
-function updateToggleUI(toggleButton, isOn)
-    if isOn then
-        toggleButton.BackgroundColor3 = Color3.fromRGB(100, 255, 100)
-        toggleButton.Text = "ON"
+local wlset, blset = {}, {}
+local function rebuild_sets()
+    wlset = {}; for _,v in ipairs(Config.whitelist or {}) do wlset[string.lower(v)] = true end
+    blset = {}; for _,v in ipairs(Config.blacklist or {}) do blset[string.lower(v)] = true end
+end
+rebuild_sets()
+
+local function pass_filters(ent)
+    if not ent then return false end
+    if Config.moneyFilter and ent.moneyPerSec < Config.moneyFilter then return false end
+    if next(wlset) ~= nil then
+        return wlset[string.lower(ent.name or "")] == true
     else
-        toggleButton.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
-        toggleButton.Text = "OFF"
+        if blset[string.lower(ent.name or "")] then return false end
     end
-end
-
--- Server Card Creation
-local function createServerCard(serverData, order)
-    local card = Instance.new("Frame")
-    card.Name = serverData.jobId
-    card.Size = UDim2.new(0.95, 0, 0, 60)
-    card.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    card.BackgroundTransparency = 0.2
-    card.BorderSizePixel = 0
-    card.LayoutOrder = order
-    
-    local padding = Instance.new("UIPadding")
-    padding.PaddingLeft = UDim.new(0, 15)
-    padding.PaddingRight = UDim.new(0, 15)
-    padding.PaddingTop = UDim.new(0, 8)
-    padding.PaddingBottom = UDim.new(0, 8)
-    padding.Parent = card
-    
-    local nameLabel = Instance.new("TextLabel")
-    nameLabel.Name = "Name"
-    nameLabel.Size = UDim2.new(0.4, 0, 1, 0)
-    nameLabel.Position = UDim2.new(0, 0, 0, 0)
-    nameLabel.BackgroundTransparency = 1
-    nameLabel.Text = serverData.name
-    nameLabel.TextColor3 = Color3.fromRGB(0, 0, 0)
-    nameLabel.TextSize = 18
-    nameLabel.Font = Enum.Font.GothamBold
-    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
-    nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
-    nameLabel.Parent = card
-    
-    local moneyLabel = Instance.new("TextLabel")
-    moneyLabel.Name = "Money"
-    moneyLabel.Size = UDim2.new(0.15, 0, 1, 0)
-    moneyLabel.Position = UDim2.new(0.4, 0, 0, 0)
-    moneyLabel.BackgroundTransparency = 1
-    local moneyStr = serverData.moneyPerSec >= 1000000000 and string.format("%.1fb/s", serverData.moneyPerSec / 1000000000)
-        or serverData.moneyPerSec >= 1000000 and string.format("%.1fm/s", serverData.moneyPerSec / 1000000)
-        or serverData.moneyPerSec >= 1000 and string.format("%.1fk/s", serverData.moneyPerSec / 1000)
-        or string.format("%.0f/s", serverData.moneyPerSec)
-    moneyLabel.Text = "$" .. moneyStr
-    moneyLabel.TextColor3 = Color3.fromRGB(0, 200, 0)
-    moneyLabel.TextSize = 16
-    moneyLabel.Font = Enum.Font.GothamBold
-    moneyLabel.TextXAlignment = Enum.TextXAlignment.Left
-    moneyLabel.Parent = card
-    
-    local playersLabel = Instance.new("TextLabel")
-    playersLabel.Name = "Players"
-    playersLabel.Size = UDim2.new(0.1, 0, 1, 0)
-    playersLabel.Position = UDim2.new(0.55, 0, 0, 0)
-    playersLabel.BackgroundTransparency = 1
-    playersLabel.Text = string.format("%d/%d", serverData.players, serverData.maxPlayers)
-    playersLabel.TextColor3 = Color3.fromRGB(0, 150, 255)
-    playersLabel.TextSize = 16
-    playersLabel.Font = Enum.Font.GothamBold
-    playersLabel.TextXAlignment = Enum.TextXAlignment.Left
-    playersLabel.Parent = card
-    
-    local joinButton = Instance.new("TextButton")
-    joinButton.Name = "Join"
-    joinButton.Size = UDim2.new(0.15, 0, 0.7, 0)
-    joinButton.Position = UDim2.new(0.8, 0, 0.15, 0)
-    joinButton.BackgroundColor3 = Color3.fromRGB(100, 255, 100)
-    joinButton.BorderSizePixel = 0
-    joinButton.Text = "JOIN"
-    joinButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-    joinButton.TextSize = 16
-    joinButton.Font = Enum.Font.GothamBold
-    joinButton.Parent = card
-    
-    local newBadge = Instance.new("TextLabel")
-    newBadge.Name = "NewBadge"
-    newBadge.Size = UDim2.new(0.12, 0, 0.5, 0)
-    newBadge.Position = UDim2.new(0.65, 0, 0.25, 0)
-    newBadge.BackgroundColor3 = Color3.fromRGB(255, 200, 0)
-    newBadge.BackgroundTransparency = 0.2
-    newBadge.BorderSizePixel = 0
-    newBadge.Text = "NEW"
-    newBadge.TextColor3 = Color3.fromRGB(255, 255, 255)
-    newBadge.TextSize = 12
-    newBadge.Font = Enum.Font.GothamBold
-    newBadge.Visible = false
-    newBadge.Parent = card
-    
-    joinButton.MouseButton1Click:Connect(function()
-        joinServer(serverData.jobId)
-    end)
-    
-    return card
-end
-
--- Network Functions
-local function fetchServers()
-    local success, response = pcall(function()
-        -- Use HttpGet with headers
-        local headers = {
-            ["Authorization"] = "Bearer " .. CONFIG.API_KEY
-        }
-        return game:HttpGet(CONFIG.API_ENDPOINT, false, headers)
-    end)
-    
-    if not success or not response then
-        return nil, "Network error"
-    end
-    
-    local lines = {}
-    for line in response:gmatch("[^\r\n]+") do
-        if line and line ~= "" then
-            table.insert(lines, line)
-        end
-    end
-    
-    return lines, nil
-end
-
--- Filtering & Sorting
-local function passesFilters(serverData)
-    -- Money filter
-    if state.config.moneyFilter > 0 then
-        local filterValue = normalizeMoney(tostring(state.config.moneyFilter))
-        if serverData.moneyPerSec < filterValue then
-            return false
-        end
-    end
-    
-    -- Whitelist (priority)
-    if #state.config.whitelist > 0 then
-        local found = false
-        for _, name in ipairs(state.config.whitelist) do
-            if serverData.name:lower():find(name:lower(), 1, true) then
-                found = true
-                break
-            end
-        end
-        if not found then return false end
-    else
-        -- Blacklist (only if whitelist is empty)
-        for _, name in ipairs(state.config.blacklist) do
-            if serverData.name:lower():find(name:lower(), 1, true) then
-                return false
-            end
-        end
-    end
-    
     return true
 end
 
-local function sortServers()
-    local sorted = {}
-    for jobId, server in pairs(state.servers) do
-        table.insert(sorted, server)
-    end
-    
-    table.sort(sorted, function(a, b)
-        return a.moneyPerSec > b.moneyPerSec
+local function sort_entries(list)
+    table.sort(list, function(a,b)
+        if a.moneyPerSec ~= b.moneyPerSec then return a.moneyPerSec > b.moneyPerSec end
+        local ta, tb = appearTimes[a.jobId] or 1e9, appearTimes[b.jobId] or 1e9
+        return ta < tb
     end)
-    
-    return sorted
 end
 
--- Join Functions
-local function joinServer(jobId)
-    local server = state.servers[jobId]
-    if not server then return end
-    
-    if server.players >= server.maxPlayers then
-        -- Trigger retry
-        if state.config.retryAmount > 0 then
-            state.retryJobId = jobId
-            state.retryAttempts = 0
-            state.retryActive = true
-            print("Server full, starting retry...")
-        else
-            warn("Server is full!")
-        end
-        return
-    end
-    
-    local success, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(
-            CONFIG.PLACE_ID,
-            jobId,
-            LocalPlayer
-        )
-    end)
-    
-    if success then
-        state.currentJobId = jobId
-        if state.config.autoJoin then
-            state.config.autoJoin = false
-            saveConfig()
-        end
-        print("Joining server:", server.name)
-    else
-        warn("Failed to join:", err)
-        -- Retry on failure if enabled
-        if state.config.retryAmount > 0 and not state.retryActive then
-            state.retryJobId = jobId
-            state.retryAttempts = 0
-            state.retryActive = true
-        end
-    end
+--============================[ UI Binding ]============================--
+
+local function get_card()
+    local c = table.remove(cardPool)
+    if c then return c end
+    return make_card()
 end
 
--- Auto Join Logic
-local function tryAutoJoin()
-    if not state.config.autoJoin then return end
-    
-    -- Don't auto join if already retrying
-    if state.retryActive then return end
-    
-    local sorted = sortServers()
-    local newestSuitable = nil
-    local currentTime = tick()
-    
-    for _, server in ipairs(sorted) do
-        if passesFilters(server) then
-            local age = currentTime - (server.orderTime or server.timestamp)
-            if age < CONFIG.NEW_BADGE_DURATION then
-                newestSuitable = server
-                break
+local function recycle_card(card)
+    if not card then return end
+    card.Parent = nil
+    table.insert(cardPool, card)
+end
+
+local function update_card(card, ent, isNew)
+    card.Name.Text = ent.name
+    card.Money.Text = ("$%s"):format(short_money(ent.moneyPerSec))
+    card.Players.Text = ("%d/%d"):format(ent.players, ent.maxPlayers)
+    card.LayoutOrder = -ent.moneyPerSec -- high first
+    local showNew = (tick() - (appearTimes[ent.jobId] or tick())) <= 5
+    card.NewBadge.Visible = showNew
+
+    if isNew then
+        card.BackgroundTransparency = 0.6
+        TweenService:Create(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            {BackgroundTransparency = 0.1}):Play()
+    end
+
+    if not card.Join._connected then
+        card.Join._connected = true
+        card.Join.MouseButton1Click:Connect(function()
+            AutoJoinInProgress = true
+            local retryAmount = math.max(0, Config.retryAmount or 0)
+            local ok = join_with_retry(ent.jobId, retryAmount)
+            if ok then
+                Config.autoJoin = false; save_config()
+                if Config.autoInject then prepare_auto_inject_on_teleport() end
+            else
+                show_banner("Teleport failed / retries exhausted.", 2.2)
             end
-            if not newestSuitable then
-                newestSuitable = server
-            end
-        end
-    end
-    
-    if newestSuitable then
-        joinServer(newestSuitable.jobId)
+            AutoJoinInProgress = false
+        end)
     end
 end
 
--- Join Retry Logic
-local function processRetry()
-    if not state.retryActive or not state.retryJobId then return end
-    
-    if state.config.retryAmount <= 0 then
-        state.retryActive = false
-        state.retryJobId = nil
-        return
+local function rebuild_list()
+    local arr = {}
+    for _, ent in pairs(entries) do
+        if pass_filters(ent) then table.insert(arr, ent) end
     end
-    
-    if state.retryAttempts >= state.config.retryAmount then
-        state.retryActive = false
-        state.retryJobId = nil
-        print("Retry limit reached")
-        return
-    end
-    
-    state.retryAttempts = state.retryAttempts + 1
-    print(string.format("Join retry %d/%d", state.retryAttempts, state.config.retryAmount))
-    
-    local server = state.servers[state.retryJobId]
-    if server then
-        if server.players < server.maxPlayers then
-            joinServer(state.retryJobId)
-            state.retryActive = false
-            state.retryJobId = nil
-        end
-    else
-        -- Server no longer exists, stop retry
-        state.retryActive = false
-        state.retryJobId = nil
-    end
-end
+    sort_entries(arr)
 
--- Auto Inject Logic
-local function checkAutoInject()
-    if not state.config.autoInject then return end
-    
-    local currentPlaceId = game.PlaceId
-    if currentPlaceId == CONFIG.PLACE_ID then
-        -- Check if we just joined
-        if state.currentJobId then
-            -- We're in the target place, inject script
-            local success, scriptContent = pcall(function()
-                return game:HttpGet(CONFIG.INJECT_URL)
+    local inUse = {}
+    for _, ent in ipairs(arr) do
+        local card = cardByJob[ent.jobId]
+        local freshAttach = false
+        if not card then
+            card = get_card()
+            cardByJob[ent.jobId] = card
+            card.Parent = List
+            freshAttach = true
+        end
+        update_card(card, ent, freshAttach)
+        inUse[ent.jobId] = true
+    end
+
+    for jobId, card in pairs(cardByJob) do
+        if not inUse[jobId] then
+            TweenService:Create(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                {BackgroundTransparency = 0.8}):Play()
+            task.delay(0.2, function()
+                recycle_card(card)
             end)
-            
-            if success and scriptContent then
-                local success2, err = pcall(function()
-                    loadstring(scriptContent)()
-                end)
-                
-                if success2 then
-                    print("Auto-injected script successfully")
-                else
-                    warn("Failed to execute injected script:", err)
+            cardByJob[jobId] = nil
+        end
+    end
+end
+
+--============================[ Polling / TTL / Throttle ]============================--
+
+local TTL_SECONDS = 180
+
+local function process_lines(lines)
+    local now = tick()
+    if not lines then return end
+    for _, line in ipairs(lines) do
+        local ent = parse_line(line)
+        if ent and ent.jobId then
+            if not entries[ent.jobId] then
+                entries[ent.jobId] = ent
+                appearTimes[ent.jobId] = now
+            else
+                local ex = entries[ent.jobId]
+                ex.name = ent.name
+                ex.moneyPerSec = ent.moneyPerSec
+                ex.players = ent.players
+                ex.maxPlayers = ent.maxPlayers
+                ex.timestamp = ent.timestamp
+            end
+        end
+    end
+end
+
+-- TTL that compares epoch-to-epoch (server timestamp) or tick fallback
+local function prune_ttl()
+    local now_tick = tick()
+    local now_epoch = os.time()
+
+    for jobId, ent in pairs(entries) do
+        local born_epoch = (ent.timestamp and ent.timestamp > 0) and ent.timestamp or nil
+        local age_sec
+
+        if born_epoch then
+            age_sec = math.max(0, now_epoch - born_epoch)
+        else
+            local born_tick = appearTimes[jobId] or now_tick
+            age_sec = math.max(0, now_tick - born_tick)
+        end
+
+        if age_sec >= TTL_SECONDS then
+            entries[jobId] = nil
+            appearTimes[jobId] = nil
+            local card = cardByJob[jobId]
+            if card then
+                TweenService:Create(card, TweenInfo.new(0.18), {BackgroundTransparency=0.8}):Play()
+                task.delay(0.2, function() recycle_card(card) end)
+                cardByJob[jobId] = nil
+            end
+        end
+    end
+end
+
+-- Auto-join selection: prefer newly appeared suitable server if multiple
+local function pick_best_for_autojoin()
+    local candidates = {}
+    for _, ent in pairs(entries) do
+        if pass_filters(ent) then
+            table.insert(candidates, ent)
+        end
+    end
+    if #candidates == 0 then return nil end
+    table.sort(candidates, function(a,b)
+        local ta, tb = appearTimes[a.jobId] or 0, appearTimes[b.jobId] or 0
+        if ta ~= tb then return ta > tb end -- newest first
+        if a.moneyPerSec ~= b.moneyPerSec then return a.moneyPerSec > b.moneyPerSec end
+        return a.jobId < b.jobId
+    end)
+    return candidates[1]
+end
+
+--============================[ Main Loop ]============================--
+
+-- gentle entrance
+blur.Size = 0
+TweenService:Create(blur, TweenInfo.new(0.25), {Size = 4}):Play()
+
+local lastPoll = 0
+local errorStreak = 0
+
+-- Heartbeat to adapt poll rate from FPS
+RunService.Heartbeat:Connect(function(dt)
+    avgDt = avgDt*0.9 + dt*0.1
+    local fps = 1 / math.max(avgDt, 1e-3)
+    if tick() - lastFPSCheck > 1.0 then
+        if fps < 30 then
+            pollInterval = math.min(maxInterval, pollInterval + 0.10)
+        elseif fps < 50 then
+            pollInterval = math.min(maxInterval, pollInterval + 0.05)
+        else
+            pollInterval = math.max(minInterval, pollInterval - 0.02)
+        end
+        lastFPSCheck = tick()
+    end
+end)
+
+task.spawn(function()
+    while RootGui.Parent do
+        local now = tick()
+        if now - lastPoll >= pollInterval + (backoff/1000) then
+            lastPoll = now
+            local lines, err = fetch_lines()
+            if lines then
+                if errorStreak > 0 then
+                    show_banner("Network recovered.", 1.4)
+                end
+                errorStreak = 0
+                backoff = 0
+                process_lines(lines)
+                prune_ttl()
+                rebuild_sets()
+                rebuild_list()
+
+                if Config.autoJoin and not AutoJoinInProgress then
+                    local target = pick_best_for_autojoin()
+                    if target then
+                        local attempts = math.max(0, Config.retryAmount or 0)
+                        AutoJoinInProgress = true
+                        local ok = join_with_retry(target.jobId, attempts)
+                        if ok then
+                            Config.autoJoin = false; save_config()
+                            if Config.autoInject then prepare_auto_inject_on_teleport() end
+                        end
+                        AutoJoinInProgress = false
+                    end
                 end
             else
-                warn("Failed to fetch injection script")
+                errorStreak += 1
+                backoff = (errorStreak == 1 and 200) or (errorStreak == 2 and 500) or 1000
+                show_banner("Network error: "..tostring(err or "unknown").." • backing off", 1.8)
             end
-            
-            state.currentJobId = nil -- Reset to avoid re-injecting
         end
+        task.wait(0.01)
     end
-end
+end)
 
--- UI Update Functions
-local function updateServerList(rightPanel)
-    local sorted = sortServers()
-    local currentTime = tick()
-    
-    -- Track existing cards
-    local existingCards = {}
-    for _, child in ipairs(rightPanel:GetChildren()) do
-        if child:IsA("Frame") and child.Name ~= "UIListLayout" then
-            existingCards[child.Name] = child
-        end
-    end
-    
-    -- Update or create cards
-    for i, server in ipairs(sorted) do
-        local card = existingCards[server.jobId]
-        
-        if not card then
-            -- Create new card
-            server.ui = createServerCard(server, i)
-            server.ui.Parent = rightPanel
-            server.orderTime = currentTime
-            card = server.ui
-        else
-            -- Reuse existing card
-            server.ui = card
-            card.LayoutOrder = i
-            card.Parent = rightPanel
-        end
-        
-        -- Update card content
-        local nameLabel = card:FindFirstChild("Name")
-        if nameLabel then
-            nameLabel.Text = server.name
-        end
-        
-        local moneyLabel = card:FindFirstChild("Money")
-        if moneyLabel then
-            local moneyStr = server.moneyPerSec >= 1000000000 and string.format("%.1fb/s", server.moneyPerSec / 1000000000)
-                or server.moneyPerSec >= 1000000 and string.format("%.1fm/s", server.moneyPerSec / 1000000)
-                or server.moneyPerSec >= 1000 and string.format("%.1fk/s", server.moneyPerSec / 1000)
-                or string.format("%.0f/s", server.moneyPerSec)
-            moneyLabel.Text = "$" .. moneyStr
-        end
-        
-        local playersLabel = card:FindFirstChild("Players")
-        if playersLabel then
-            playersLabel.Text = string.format("%d/%d", server.players, server.maxPlayers)
-        end
-        
-        -- Update NEW badge
-        local newBadge = card:FindFirstChild("NewBadge")
-        if newBadge then
-            local age = currentTime - (server.orderTime or server.timestamp)
-            newBadge.Visible = age < CONFIG.NEW_BADGE_DURATION
-        end
-    end
-    
-    -- Remove cards for servers that no longer exist
-    for jobId, card in pairs(existingCards) do
-        if not state.servers[jobId] then
-            card:Destroy()
-        end
-    end
-    
-    -- Update canvas size
-    rightPanel.CanvasSize = UDim2.new(0, 0, 0, #sorted * 68)
-end
-
-local function updateServers()
-    local lines, err = fetchServers()
-    
-    if not lines then
-        state.networkError = true
-        return
-    end
-    
-    state.networkError = false
-    local currentTime = tick()
-    local newServers = {}
-    
-    for _, line in ipairs(lines) do
-        local serverData = parseServerLine(line)
-        if serverData then
-            local jobId = serverData.jobId
-            
-            if state.servers[jobId] then
-                -- Update existing
-                state.servers[jobId].name = serverData.name
-                state.servers[jobId].moneyPerSec = serverData.moneyPerSec
-                state.servers[jobId].players = serverData.players
-                state.servers[jobId].maxPlayers = serverData.maxPlayers
-                state.servers[jobId].timestamp = serverData.timestamp
-            else
-                -- New server
-                state.orderCounter = state.orderCounter + 1
-                state.servers[jobId] = {
-                    name = serverData.name,
-                    moneyPerSec = serverData.moneyPerSec,
-                    players = serverData.players,
-                    maxPlayers = serverData.maxPlayers,
-                    jobId = jobId,
-                    timestamp = serverData.timestamp,
-                    order = state.orderCounter,
-                    orderTime = currentTime,
-                    ui = nil
-                }
-                newServers[jobId] = true
-            end
-        end
-    end
-    
-    -- Remove expired servers (TTL)
-    for jobId, server in pairs(state.servers) do
-        local age = currentTime - server.timestamp
-        if age > CONFIG.TTL then
-            if server.ui then
-                server.ui:Destroy()
-            end
-            state.servers[jobId] = nil
-        end
-    end
-    
-    -- Trigger auto join for new servers
-    if state.config.autoJoin then
-        for jobId, _ in pairs(newServers) do
-            if passesFilters(state.servers[jobId]) then
-                tryAutoJoin()
-                break
-            end
-        end
-    end
-end
-
--- Main Loop
-local function main()
-    -- Load config
-    loadConfig()
-    
-    -- Create UI
-    local screenGui, leftPanel, rightPanel, errorBanner = createUI()
-    state.screenGui = screenGui
-    
-    -- Toggle UI visibility with K key
-    UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        if gameProcessed then return end
-        
-        if input.KeyCode == Enum.KeyCode.K then
-            state.uiVisible = not state.uiVisible
-            if screenGui then
-                screenGui.Enabled = state.uiVisible
-            end
-        end
+-- Clean up blur on script end (best effort)
+local function on_close()
+    TweenService:Create(blur, TweenInfo.new(0.25), {Size = 0}):Play()
+    task.delay(0.3, function()
+        if blur and blur.Parent then pcall(function() blur:Destroy() end) end
     end)
-    
-    -- Retry timer
-    local lastRetryTime = 0
-    
-    -- Main update loop
-    local connection
-    connection = RunService.Heartbeat:Connect(function()
-        local currentTime = tick()
-        local deltaTime = tick() - state.lastFrameTime
-        state.lastFrameTime = currentTime
-        
-        -- Throttle based on frame time
-        if deltaTime > CONFIG.MAX_FRAME_TIME then
-            wait(0.05) -- Slow down if FPS drops
-        end
-        
-        -- Only update UI if visible
-        if state.uiVisible then
-            -- Poll servers
-            if currentTime - state.lastPollTime >= CONFIG.POLL_RATE then
-                state.lastPollTime = currentTime
-                updateServers()
-                updateServerList(rightPanel)
-            end
-            
-            -- Update error banner
-            errorBanner.Visible = state.networkError
-        else
-            -- Still poll servers in background (but don't update UI)
-            if currentTime - state.lastPollTime >= CONFIG.POLL_RATE then
-                state.lastPollTime = currentTime
-                updateServers()
-            end
-        end
-        
-        -- Process retry (every 100ms)
-        if currentTime - lastRetryTime >= CONFIG.RETRY_RATE then
-            lastRetryTime = currentTime
-            processRetry()
-        end
-        
-        -- Check auto inject
-        checkAutoInject()
-    end)
-    
-    -- Initial update
-    updateServers()
-    if state.uiVisible then
-        updateServerList(rightPanel)
-    end
 end
 
--- Start
-main()
- 
+RootGui.AncestryChanged:Connect(function(_, parent)
+    if not parent then on_close() end
+end)
+
+print("[Zamorozka] Loaded. UI ready. Config:", HttpService:JSONEncode(Config))
