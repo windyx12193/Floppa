@@ -1,13 +1,12 @@
---[[ Floppa Auto Joiner — Minimal UI (headless list) + Settings + Auto-Inject
-     Goals:
-       • Tiny menu (~260x190), rounded corners
-       • Start/Stop Auto Join button
-       • Min profit per second filter (in MILLIONS)
-       • Settings persistence (JSON file)
-       • Auto re-inject on teleport using provided GitHub URL
-       • No heavy list rendering → no micro-freezes
-       • Pulls site data (JSON or line format) → filters → tries to join
-         If server is full (Teleport fails), retry up to 65 times at 10/s (every 0.1s), then skip
+--[[ Floppa Auto Joiner — Minimal UI (headless) + Settings + Auto-Inject
+     • Tiny menu (~260x190), rounded corners
+     • Start/Stop Auto Join button
+     • Min profit per second filter (in MILLIONS)
+     • Settings persistence (JSON file)
+     • Auto re-inject on teleport using provided GitHub URL
+     • No heavy list rendering → no micro-freezes
+     • Pulls site data (JSON or line format) → filters → tries to join
+       If server is full (Teleport fails), retry up to 65 times at 10/s (every 0.1s), then skip
 ]]
 
 ---------------- USER/API SETTINGS ----------------
@@ -110,13 +109,9 @@ end
 
 local function parse_lines_payload(body)
     local items = {}
-    -- robust line splitting: handles 
- and 
-; avoids raw newline in pattern
-    for line in (tostring(body or "") .. "
-"):gmatch("(.-)
-?
-") do
+    local raw = tostring(body or "")
+    for _, line in ipairs(string.split(raw, "\n")) do
+        line = line:gsub("\r$", "")
         local a,b,c,d = line:match("^%s*(.-)%s*|%s*(.-)%s*|%s*(.-)%s*|%s*(.-)%s*$")
         if a and b and c and d then
             local name = tostring(a)
