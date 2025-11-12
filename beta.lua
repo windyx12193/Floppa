@@ -1,1443 +1,515 @@
--- Zamorozka Auto Joiner
--- Roblox Lua script implementing winter UI auto joiner with filtering, retry, and auto inject
+-- == FLOPPA AUTO JOINER (auto-inject fix + first-fill + hotkey close) ==
 
---//== Services ==//--
-local Players = game:GetService("Players")
-local TeleportService = game:GetService("TeleportService")
-local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
-local HttpService = game:GetService("HttpService")
-local UIS = game:GetService("UserInputService")
-local Lighting = game:GetService("Lighting")
-local LogService = game:GetService("LogService")
+local AUTO_INJECT_URL   = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
+local FIXED_HOTKEY      = Enum.KeyCode.T
+local SETTINGS_PATH     = "floppa_aj_settings.json"
 
-local LOCAL_PLAYER = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+local SERVER_BASE       = "https://server-eta-two-29.vercel.app"
+local API_KEY           = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
 
---//== Configuration ==//--
-local SCRIPT_NAME = "Zamorozka Auto Joiner"
-local SCRIPT_VERSION = "1.0.0"
-local SETTINGS_FILE = "zamorozka_config.json"
-local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/beta.lua"
-local DATA_ENDPOINT = "https://server-eta-two-29.vercel.app"
-local DATA_API_KEY = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
-local PLACE_ID = 109983668079237
-local POLL_MIN_INTERVAL = 0.1
-local POLL_MAX_INTERVAL = 0.5
-local TARGET_FPS_MIN = 40
-local TARGET_FPS_MAX = 55
-local ENTRY_TTL_SECONDS = 180
-local NEW_BADGE_SECONDS = 5
-local RETRY_DELAY = 0.1
-local KEYBIND = Enum.KeyCode.K
+local TARGET_PLACE_ID   = 109983668079237
+local PULL_INTERVAL_SEC = 2.5
+local ENTRY_TTL_SEC     = 180.0
+local FRESH_AGE_SEC     = 12.0
 
---//== Utility: File IO ==//--
-local function hasFileSystem()
-    return typeof(isfile) == "function" and typeof(writefile) == "function" and typeof(readfile) == "function"
+local Players          = game:GetService("Players")
+local LocalPlayer      = Players.LocalPlayer
+local UIS              = game:GetService("UserInputService")
+local CAS              = game:GetService("ContextActionService")
+local TweenService     = game:GetService("TweenService")
+local Lighting         = game:GetService("Lighting")
+local HttpService      = game:GetService("HttpService")
+local TeleportService  = game:GetService("TeleportService")
+
+-- ========= FS helpers =========
+local function hasFS() return typeof(writefile)=="function" and typeof(readfile)=="function" and typeof(isfile)=="function" end
+local function saveJSON(path, t)
+    if not hasFS() then return false end
+    local ok, data = pcall(function() return HttpService:JSONEncode(t) end)
+    if not ok then return false end
+    pcall(writefile, path, data); return true
+end
+local function loadJSON(path)
+    if not hasFS() or not isfile(path) then return nil end
+    local ok, data = pcall(readfile, path); if not ok or type(data)~="string" then return nil end
+    local ok2, tbl = pcall(function() return HttpService:JSONDecode(data) end); if not ok2 then return nil end
+    return tbl
 end
 
-local function loadConfig()
-    if not hasFileSystem() or not isfile(SETTINGS_FILE) then
-        return {
-            autoJoin = false,
-            autoInject = false,
-            moneyFilter = "0",
-            retryAmount = 0,
-            whitelist = {},
-            blacklist = {}
-        }
-    end
-
-    local ok, content = pcall(readfile, SETTINGS_FILE)
-    if not ok or type(content) ~= "string" then
-        return {
-            autoJoin = false,
-            autoInject = false,
-            moneyFilter = "0",
-            retryAmount = 0,
-            whitelist = {},
-            blacklist = {}
-        }
-    end
-
-    local okJson, decoded = pcall(HttpService.JSONDecode, HttpService, content)
-    if okJson and type(decoded) == "table" then
-        decoded.autoJoin = decoded.autoJoin == true
-        decoded.autoInject = decoded.autoInject == true
-        decoded.moneyFilter = decoded.moneyFilter ~= nil and tostring(decoded.moneyFilter) or "0"
-        decoded.retryAmount = tonumber(decoded.retryAmount) or 0
-        decoded.whitelist = type(decoded.whitelist) == "table" and decoded.whitelist or {}
-        decoded.blacklist = type(decoded.blacklist) == "table" and decoded.blacklist or {}
-        return decoded
-    end
-
-    return {
-        autoJoin = false,
-        autoInject = false,
-        moneyFilter = "0",
-        retryAmount = 0,
-        whitelist = {},
-        blacklist = {}
-    }
+-- ========= Singleton cleanup =========
+local function guiRoot()
+    local okH, hui = pcall(function() return gethui and gethui() end)
+    if okH and hui then return hui end
+    local okC, core = pcall(function() return game:GetService("CoreGui") end)
+    if okC then return core end
+    return LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui") or nil
+end
+do
+    local root = guiRoot()
+    if root then local old = root:FindFirstChild("FloppaAutoJoinerGui"); if old then pcall(function() old:Destroy() end) end end
+    local G=(getgenv and getgenv()) or _G; G.__FLOPPA_UI_ACTIVE=true
 end
 
-local function saveConfig(cfg)
-    if not hasFileSystem() then
-        return
-    end
-    local okEncode, json = pcall(HttpService.JSONEncode, HttpService, cfg)
-    if okEncode then
-        pcall(writefile, SETTINGS_FILE, json)
+-- ========= Persisted defaults =========
+local State = { AutoJoin=false, AutoInject=false, IgnoreEnabled=false, JoinRetry=50, MinMS=1, IgnoreNames={} }
+do
+    local cfg=loadJSON(SETTINGS_PATH)
+    if cfg then
+        State.AutoJoin      = cfg.AutoJoin and true or false
+        State.AutoInject    = cfg.AutoInject and true or false
+        State.IgnoreEnabled = cfg.IgnoreEnabled and true or false
+        State.JoinRetry     = tonumber(cfg.JoinRetry) or State.JoinRetry
+        State.MinMS         = tonumber(cfg.MinMS) or State.MinMS
+        State.IgnoreNames   = type(cfg.IgnoreNames)=="table" and cfg.IgnoreNames or State.IgnoreNames
     end
 end
 
-local Config = loadConfig()
+-- ========= UI mini lib =========
+local COLORS={purpleDeep=Color3.fromRGB(96,63,196), purple=Color3.fromRGB(134,102,255), purpleSoft=Color3.fromRGB(160,135,255),
+    surface=Color3.fromRGB(18,18,22), surface2=Color3.fromRGB(26,26,32), textPrimary=Color3.fromRGB(238,238,245),
+    textWeak=Color3.fromRGB(190,190,200), on=Color3.fromRGB(64,222,125), off=Color3.fromRGB(120,120,130),
+    joinBtn=Color3.fromRGB(67,232,113), stroke=Color3.fromRGB(70,60,140)}
+local ALPHA={panel=0.12, card=0.18}
 
---//== Utility Helpers ==//--
-local function splitCSV(str)
-    local list = {}
-    if type(str) ~= "string" then
-        return list
+local function roundify(o,px) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,px or 10); c.Parent=o end
+local function stroke(o,col,th,tr)
+    local s=Instance.new("UIStroke")
+    s.Color = col or COLORS.stroke
+    s.Thickness = th or 1
+    s.Transparency = tr or 0.25
+    pcall(function() s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border end)
+    s.Parent = o
+end
+local function padding(o,l,t,r,b) local p=Instance.new("UIPadding"); p.PaddingLeft=UDim.new(0,l or 0); p.PaddingTop=UDim.new(0,t or 0); p.PaddingRight=UDim.new(0,r or 0); p.PaddingBottom=UDim.new(0,b or 0); p.Parent=o end
+local function setFont(x,w) local ok=pcall(function() x.Font=(w=="bold" and Enum.Font.GothamBold) or (w=="medium" and Enum.Font.GothamMedium) or Enum.Font.Gotham end); if not ok then x.Font=(w=="bold" and Enum.Font.SourceSansBold) or Enum.Font.SourceSans end end
+local function mkLabel(p,txt,size,w,col) local l=Instance.new("TextLabel"); l.BackgroundTransparency=1; l.Text=txt; l.TextSize=size or 18; l.TextColor3=col or COLORS.textPrimary; l.TextXAlignment=Enum.TextXAlignment.Left; setFont(l,w); l.Parent=p; return l end
+local function mkHeader(p,txt) local h=Instance.new("Frame"); h.Size=UDim2.new(1,0,0,38); h.BackgroundColor3=COLORS.surface2; h.BackgroundTransparency=ALPHA.card; h.Parent=p; roundify(h,8); stroke(h); padding(h,12,6,12,6); local g=Instance.new("UIGradient"); g.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,COLORS.purpleDeep),ColorSequenceKeypoint.new(1,COLORS.purple)}; g.Transparency=NumberSequence.new{NumberSequenceKeypoint.new(0,0.4),NumberSequenceKeypoint.new(1,0.4)}; g.Rotation=90; g.Parent=h; mkLabel(h,txt,18,"bold",COLORS.textPrimary).Size=UDim2.new(1,0,1,0); return h end
+local function mkToggle(p,txt,def)
+    local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,44); row.BackgroundColor3=COLORS.surface2; row.BackgroundTransparency=ALPHA.card; row.Parent=p; roundify(row,10); stroke(row); padding(row,12,0,12,0)
+    mkLabel(row,txt,17,"medium",COLORS.textPrimary).Size=UDim2.new(1,-80,1,0)
+    local sw=Instance.new("TextButton"); sw.Text=""; sw.AutoButtonColor=false; sw.BackgroundColor3=Color3.fromRGB(40,40,48); sw.BackgroundTransparency=0.2; sw.Size=UDim2.new(0,62,0,28); sw.AnchorPoint=Vector2.new(1,0.5); sw.Position=UDim2.new(1,-6,0.5,0); sw.Parent=row; roundify(sw,14); stroke(sw,COLORS.purpleSoft,1,0.35)
+    local dot=Instance.new("Frame"); dot.Size=UDim2.new(0,24,0,24); dot.Position=UDim2.new(0,2,0.5,-12); dot.BackgroundColor3=COLORS.off; dot.Parent=sw; roundify(dot,12)
+    local state={Value=def and true or false, Changed=nil}
+    local function apply(v,inst)
+        state.Value=v
+        local pos=v and UDim2.new(1,-26,0.5,-12) or UDim2.new(0,2,0.5,-12)
+        local col=v and COLORS.on or COLORS.off
+        if inst then dot.Position=pos; dot.BackgroundColor3=col; sw.BackgroundColor3=v and Color3.fromRGB(55,58,74) or Color3.fromRGB(40,40,48)
+        else TweenService:Create(dot,TweenInfo.new(0.13,Enum.EasingStyle.Sine),{Position=pos}):Play(); TweenService:Create(dot,TweenInfo.new(0.12,Enum.EasingStyle.Sine),{BackgroundColor3=col}):Play(); TweenService:Create(sw,TweenInfo.new(0.12,Enum.EasingStyle.Sine),{BackgroundColor3=v and Color3.fromRGB(55,58,74) or Color3.fromRGB(40,40,48)}):Play() end
+        if state.Changed then task.defer(function() pcall(state.Changed,state.Value) end) end
     end
-    for token in string.gmatch(str, "[^,]+") do
-        local cleaned = token:gsub("^%s+", ""):gsub("%s+$", "")
-        if #cleaned > 0 then
-            list[#list + 1] = cleaned
-        end
-    end
-    return list
+    apply(state.Value,true)
+    sw.MouseButton1Click:Connect(function() apply(not state.Value,false) end)
+    return row, state, apply
+end
+local function mkStackInput(p,title,ph,def,isNum)
+    local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,70); row.BackgroundColor3=COLORS.surface2; row.BackgroundTransparency=ALPHA.card; row.Parent=p; roundify(row,10); stroke(row); padding(row,12,8,12,12)
+    mkLabel(row,title,16,"medium",COLORS.textPrimary).Size=UDim2.new(1,0,0,18)
+    local box=Instance.new("TextBox"); box.PlaceholderText=ph or ""; box.Text=def or ""; box.ClearTextOnFocus=false; box.TextSize=17; box.TextColor3=COLORS.textPrimary; box.PlaceholderColor3=COLORS.textWeak; box.BackgroundColor3=Color3.fromRGB(32,32,38); box.BackgroundTransparency=0.15; box.Size=UDim2.new(1,0,0,30); box.Position=UDim2.new(0,0,0,30); roundify(box,8); stroke(box,COLORS.purpleSoft,1,0.35); box.Parent=row
+    if isNum then box:GetPropertyChangedSignal("Text"):Connect(function() box.Text=box.Text:gsub("[^%d]","") end) end
+    local state={}
+    box.FocusLost:Connect(function() state.Value=isNum and (tonumber(box.Text) or 0) or box.Text end)
+    return row, state, box
 end
 
-local magnitudeMap = {
-    k = 1e3,
-    m = 1e6,
-    b = 1e9,
-    t = 1e12
-}
+-- ========= Blur =========
+local blur=Lighting:FindFirstChild("FloppaLightBlur") or Instance.new("BlurEffect"); blur.Name="FloppaLightBlur"; blur.Size=0; blur.Enabled=false; blur.Parent=Lighting
+local function setBlur(e) if e then blur.Enabled=true; TweenService:Create(blur,TweenInfo.new(0.15,Enum.EasingStyle.Sine),{Size=4}):Play() else TweenService:Create(blur,TweenInfo.new(0.15,Enum.EasingStyle.Sine),{Size=0}):Play(); task.delay(0.16,function() blur.Enabled=false end) end end
 
-local function parseMoney(text)
-    if type(text) ~= "string" then
-        return 0
-    end
-    local cleaned = text:lower():gsub(",", "")
-    local numberPart, suffix = cleaned:match("%$%s*([%d%.]+)%s*([kmbt]?)%s*/?s")
-    if not numberPart then
-        numberPart, suffix = cleaned:match("([%d%.]+)%s*([kmbt]?)")
-    end
-    local value = tonumber(numberPart or "0") or 0
-    local multiplier = magnitudeMap[suffix or ""] or 1
-    local normalized = math.floor(value * multiplier + 0.5)
-    return normalized
-end
+-- ========= Root GUI =========
+local root=guiRoot() or LocalPlayer:WaitForChild("PlayerGui")
+local gui=Instance.new("ScreenGui"); gui.Name="FloppaAutoJoinerGui"; gui.IgnoreGuiInset=true; gui.ResetOnSpawn=false; gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; gui.DisplayOrder=1e6; gui.Parent=root
 
-local function formatMoneyShort(value)
-    if value >= 1e9 then
-        return string.format("$%.1fb/s", value / 1e9)
-    elseif value >= 1e6 then
-        return string.format("$%.1fm/s", value / 1e6)
-    elseif value >= 1e3 then
-        return string.format("$%.1fk/s", value / 1e3)
-    else
-        return string.format("$%d/s", value)
-    end
-end
+local main=Instance.new("Frame"); main.Size=UDim2.new(0,980,0,560); main.Position=UDim2.new(0.5,-490,0.5,-280); main.BackgroundColor3=COLORS.surface; main.BackgroundTransparency=ALPHA.panel; main.Parent=gui; roundify(main,14); stroke(main,COLORS.purpleSoft,1.5,0.35); padding(main,10,10,10,10)
 
-local function parseTimestamp(text)
-    if type(text) ~= "string" or #text == 0 then
-        return os.time()
-    end
-    local day, month, year, hour, min, sec = text:match("(%d%d?)%.(%d%d?)%.(%d%d%d%d)[,%s]+(%d%d?):(%d%d):(%d%d)")
-    if day and month and year and hour and min and sec then
-        local success, value = pcall(os.time, {
-            day = tonumber(day),
-            month = tonumber(month),
-            year = tonumber(year),
-            hour = tonumber(hour),
-            min = tonumber(min),
-            sec = tonumber(sec)
-        })
-        if success and value then
-            return value
-        end
-    end
-    return os.time()
-end
+local header=Instance.new("Frame"); header.Size=UDim2.new(1,0,0,48); header.BackgroundColor3=COLORS.surface2; header.BackgroundTransparency=ALPHA.card; header.Parent=main; roundify(header,10); stroke(header); padding(header,14,6,14,6)
+mkLabel(header,"FLOPPA AUTO JOINER",20,"bold",COLORS.textPrimary).Size=UDim2.new(0.6,0,1,0)
 
-local function safeRequest(options)
-    local req = (syn and syn.request) or http_request or request or (fluxus and fluxus.request)
-    if req then
-        local ok, result = pcall(req, options)
-        if ok and result and result.StatusCode == 200 and type(result.Body) == "string" then
-            return true, result.Body
-        end
-    end
-    local fallbackUrl = options.Url
-    if DATA_API_KEY and not fallbackUrl:lower():find("key=") then
-        local joiner = fallbackUrl:find("?", 1, true) and "&" or "?"
-        fallbackUrl = string.format("%s%ckey=%s", fallbackUrl, joiner, DATA_API_KEY)
-    end
-    local ok, body = pcall(function()
-        return game:HttpGet(fallbackUrl, true)
+local hotkeyInfo=mkLabel(header,"OPEN/CLOSE:  T",16,"medium",COLORS.textWeak); hotkeyInfo.AnchorPoint=Vector2.new(1,0.5); hotkeyInfo.Position=UDim2.new(1,-120,0.5,0); hotkeyInfo.Size=UDim2.new(0.25,0,1,0); hotkeyInfo.TextXAlignment=Enum.TextXAlignment.Right
+
+local refreshBtn=Instance.new("TextButton"); refreshBtn.Text="Refresh"; setFont(refreshBtn,"medium"); refreshBtn.TextSize=14; refreshBtn.TextColor3=COLORS.textPrimary; refreshBtn.BackgroundColor3=COLORS.surface; refreshBtn.BackgroundTransparency=0.1; refreshBtn.Size=UDim2.new(0,80,0,28); refreshBtn.AnchorPoint=Vector2.new(1,0.5); refreshBtn.Position=UDim2.new(1,-220,0.5,0); refreshBtn.AutoButtonColor=true; roundify(refreshBtn,8); stroke(refreshBtn,COLORS.purpleSoft,1,0.4); refreshBtn.Parent=header
+
+local closeBtn=Instance.new("TextButton"); closeBtn.Text="×"; setFont(closeBtn,"bold"); closeBtn.TextSize=20; closeBtn.TextColor3=COLORS.textPrimary; closeBtn.BackgroundTransparency=0.1; closeBtn.Size=UDim2.new(0,32,0,28); closeBtn.AnchorPoint=Vector2.new(1,0.5); closeBtn.Position=UDim2.new(1,-10,0.5,0); closeBtn.AutoButtonColor=true; closeBtn.BackgroundColor3=COLORS.surface; roundify(closeBtn,8); stroke(closeBtn,COLORS.purpleSoft,1,0.4); closeBtn.Parent=header
+
+local left=Instance.new("ScrollingFrame"); left.Size=UDim2.new(0,300,1,-58); left.Position=UDim2.new(0,0,0,58); left.BackgroundTransparency=1; left.ScrollBarThickness=6; left.ScrollingDirection=Enum.ScrollingDirection.Y; left.CanvasSize=UDim2.new(0,0,0,0); left.Parent=main
+local leftPad=padding(left,0,0,0,10); local leftList=Instance.new("UIListLayout"); leftList.Padding=UDim.new(0,10); leftList.SortOrder=Enum.SortOrder.LayoutOrder; leftList.Parent=left
+local function updLeftCanvas() left.CanvasSize=UDim2.new(0,0,0,leftList.AbsoluteContentSize.Y+leftPad.PaddingBottom.Offset) end; leftList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updLeftCanvas)
+
+local right=Instance.new("Frame"); right.Size=UDim2.new(1,-320,1,-58); right.Position=UDim2.new(0,320,0,58); right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card; right.Parent=main; roundify(right,12); stroke(right); padding(right,12,12,12,12)
+local statsLbl=mkLabel(right,"shown: 0 • min: "..tostring(State.MinMS).."M/s",13,"medium",COLORS.textWeak); statsLbl.AnchorPoint=Vector2.new(1,0); statsLbl.Position=UDim2.new(1,-10,0,8); statsLbl.Size=UDim2.new(0,280,0,16); statsLbl.TextXAlignment=Enum.TextXAlignment.Right
+local listHeader=mkHeader(right,"AVAILABLE LOBBIES"); listHeader.Size=UDim2.new(1,0,0,40)
+local scroll=Instance.new("ScrollingFrame"); scroll.BackgroundTransparency=1; scroll.Size=UDim2.new(1,0,1,-50); scroll.Position=UDim2.new(0,0,0,46); scroll.CanvasSize=UDim2.new(0,0,0,0); scroll.ScrollBarThickness=6; scroll.Parent=right
+local listLay=Instance.new("UIListLayout"); listLay.SortOrder=Enum.SortOrder.LayoutOrder; listLay.Padding=UDim.new(0,8); listLay.Parent=scroll
+
+-- ========= Left panel controls (safe) =========
+mkHeader(left, "PRIORITY ACTIONS")
+local autoJoin, jrBox, msBox, autoInject, ignoreToggle, ignoreBox
+do
+    local ok, _, st = pcall(function() local _, a = mkToggle(left, "AUTO JOIN", State.AutoJoin); return _, a end)
+    if ok then autoJoin = st else warn("[FloppaAJ] mkToggle(AUTO JOIN) failed"); autoJoin = {Value=false} end
+
+    local ok2, _, boxJR = pcall(function() local _, _, b = mkStackInput(left, "JOIN RETRY", "50", tostring(State.JoinRetry), true); return _, _, b end)
+    jrBox = ok2 and boxJR or (function() local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,60); row.BackgroundTransparency=1; row.Parent=left; local b=Instance.new("TextBox"); b.Size=UDim2.new(1,-20,0,30); b.Position=UDim2.new(0,10,0,20); b.Text=tostring(State.JoinRetry); b.Parent=row; return b end)()
+
+    mkHeader(left,"MONEY FILTERS")
+    local ok3, _, boxMS = pcall(function() local _, _, b = mkStackInput(left, "MIN M/S", "1 (= $1M/s)", tostring(State.MinMS), true); return _, _, b end)
+    msBox = ok3 and boxMS or (function() local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,60); row.BackgroundTransparency=1; row.Parent=left; local b=Instance.new("TextBox"); b.Size=UDim2.new(1,-20,0,30); b.Position=UDim2.new(0,10,0,20); b.Text=tostring(State.MinMS); b.Parent=row; return b end)()
+
+    mkHeader(left,"НАСТРОЙКИ")
+    local ok4 = pcall(function()
+        local _, a = mkToggle(left, "AUTO INJECT", State.AutoInject);   autoInject=a
+        local _, b = mkToggle(left, "ENABLE IGNORE LIST", State.IgnoreEnabled); ignoreToggle=b
     end)
-    if ok and type(body) == "string" then
-        return true, body
-    end
-    return false, nil
-end
+    if not ok4 then warn("[FloppaAJ] mkToggle(settings) failed"); autoInject={Value=false}; ignoreToggle={Value=false} end
 
-local function showConsole(msg)
-    print(string.format("[%s] %s", SCRIPT_NAME, msg))
-end
-
---//== Network Error Banner ==//--
-local errorBanner
-local function displayBanner(text, duration)
-    if not errorBanner then
-        local parent
-        local ok, hui = pcall(function()
-            return gethui and gethui()
-        end)
-        if ok and hui then
-            parent = hui
-        else
-            parent = LOCAL_PLAYER:FindFirstChildOfClass("PlayerGui") or LOCAL_PLAYER:WaitForChild("PlayerGui")
-        end
-
-        errorBanner = Instance.new("ScreenGui")
-        errorBanner.IgnoreGuiInset = true
-        errorBanner.ResetOnSpawn = false
-        errorBanner.DisplayOrder = 1_000_000
-        errorBanner.Name = "ZamorozkaBanner"
-        errorBanner.Parent = parent
-
-        local frame = Instance.new("Frame")
-        frame.Name = "BannerFrame"
-        frame.AnchorPoint = Vector2.new(0.5, 0)
-        frame.Position = UDim2.new(0.5, 0, 0, -60)
-        frame.Size = UDim2.new(0.4, 0, 0, 40)
-        frame.BackgroundColor3 = Color3.fromRGB(255, 110, 110)
-        frame.BackgroundTransparency = 0.2
-        frame.Parent = errorBanner
-
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 12)
-        corner.Parent = frame
-
-        local label = Instance.new("TextLabel")
-        label.Name = "Message"
-        label.BackgroundTransparency = 1
-        label.TextColor3 = Color3.new(1, 1, 1)
-        label.Font = Enum.Font.GothamBold
-        label.TextScaled = true
-        label.TextWrapped = true
-        label.Size = UDim2.new(1, -20, 1, 0)
-        label.Position = UDim2.new(0, 10, 0, 0)
-        label.Parent = frame
-    end
-
-    local frame = errorBanner:FindFirstChild("BannerFrame")
-    local label = frame and frame:FindFirstChild("Message")
-    if frame and label then
-        label.Text = text
-        frame.Position = UDim2.new(0.5, 0, 0, -60)
-        frame.Visible = true
-        TweenService:Create(frame, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-            Position = UDim2.new(0.5, 0, 0, 10)
-        }):Play()
-
-        task.delay(duration or 2.5, function()
-            if frame then
-                TweenService:Create(frame, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-                    Position = UDim2.new(0.5, 0, 0, -60)
-                }):Play()
-            end
-        end)
+    local ok5, _, ibox = pcall(function() local _,_, b = mkStackInput(left, "IGNORE NAMES", "name1,name2,...", table.concat(State.IgnoreNames, ","), false); return _,_,b end)
+    if ok5 then ignoreBox=ibox else
+        local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,60); row.BackgroundTransparency=1; row.Parent=left
+        local b=Instance.new("TextBox"); b.Size=UDim2.new(1,-20,0,30); b.Position=UDim2.new(0,10,0,20); b.Text=table.concat(State.IgnoreNames,","); b.Parent=row; ignoreBox=b
     end
 end
 
---//== Cleanup previous UI ==//--
-local function getGuiParent()
-    local ok, ui = pcall(function()
-        return gethui and gethui()
-    end)
-    if ok and ui then
-        return ui
-    end
-    local ok2, core = pcall(function()
-        return game:GetService("CoreGui")
-    end)
-    if ok2 and core then
-        return core
-    end
-    return LOCAL_PLAYER:FindFirstChildOfClass("PlayerGui") or LOCAL_PLAYER:WaitForChild("PlayerGui")
-end
-
-local guiParent = getGuiParent()
-local existing = guiParent:FindFirstChild("ZamorozkaAutoJoiner")
-if existing then
-    existing:Destroy()
-end
-
---//== UI Colors & Theme ==//--
-local COLORS = {
-    background = Color3.fromRGB(240, 245, 250),
-    panel = Color3.fromRGB(225, 235, 245),
-    accent = Color3.fromRGB(150, 180, 210),
-    accentBright = Color3.fromRGB(110, 160, 210),
-    accentDark = Color3.fromRGB(70, 110, 150),
-    text = Color3.fromRGB(30, 40, 50),
-    textMuted = Color3.fromRGB(90, 110, 130),
-    green = Color3.fromRGB(70, 200, 140),
-    blue = Color3.fromRGB(90, 140, 210),
-    joinButton = Color3.fromRGB(170, 230, 200)
-}
-
-local function applyCorner(instance, radius)
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, radius or 10)
-    corner.Parent = instance
-    return corner
-end
-
-local function applyStroke(instance, color, thickness)
-    local stroke = Instance.new("UIStroke")
-    stroke.Thickness = thickness or 1
-    stroke.Color = color or COLORS.accent
-    stroke.Transparency = 0.3
-    stroke.Parent = instance
-    return stroke
-end
-
-local function createLabel(parent, text, size, weight, color)
-    local label = Instance.new("TextLabel")
-    label.BackgroundTransparency = 1
-    label.Text = text
-    label.Font = weight == "bold" and Enum.Font.GothamBold or weight == "medium" and Enum.Font.GothamMedium or Enum.Font.Gotham
-    label.TextSize = size or 18
-    label.TextColor3 = color or COLORS.text
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Parent = parent
-    return label
-end
-
---//== Blur ==//--
-local blur = Lighting:FindFirstChild("ZamorozkaBlur") or Instance.new("BlurEffect")
-blur.Name = "ZamorozkaBlur"
-blur.Size = 0
-blur.Enabled = false
-blur.Parent = Lighting
-
-local function setBlur(enabled)
-    if enabled then
-        blur.Enabled = true
-        TweenService:Create(blur, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Size = 6 }):Play()
-    else
-        TweenService:Create(blur, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Size = 0 }):Play()
-        task.delay(0.22, function()
-            if blur then
-                blur.Enabled = false
-            end
-        end)
-    end
-end
-
---//== Root GUI ==//--
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "ZamorozkaAutoJoiner"
-screenGui.IgnoreGuiInset = true
-screenGui.ResetOnSpawn = false
-screenGui.DisplayOrder = 900000
-screenGui.Parent = guiParent
-
-local mainFrame = Instance.new("Frame")
-mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 960, 0, 560)
-mainFrame.Position = UDim2.new(0.5, -480, 0.5, -280)
-mainFrame.BackgroundColor3 = COLORS.background
-mainFrame.BackgroundTransparency = 0.15
-mainFrame.Parent = screenGui
-applyCorner(mainFrame, 18)
-applyStroke(mainFrame, COLORS.accentDark, 1.5)
-
-local mainPadding = Instance.new("UIPadding")
-mainPadding.PaddingTop = UDim.new(0, 10)
-mainPadding.PaddingBottom = UDim.new(0, 10)
-mainPadding.PaddingLeft = UDim.new(0, 10)
-mainPadding.PaddingRight = UDim.new(0, 10)
-mainPadding.Parent = mainFrame
-
--- Header (10-15% height)
-local headerHeight = 0.12
-local headerFrame = Instance.new("Frame")
-headerFrame.Name = "Header"
-headerFrame.Size = UDim2.new(1, 0, headerHeight, -10)
-headerFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-headerFrame.BackgroundTransparency = 0.1
-headerFrame.Parent = mainFrame
-applyCorner(headerFrame, 14)
-applyStroke(headerFrame, COLORS.accent, 1)
-
-local headerGradient = Instance.new("UIGradient")
-headerGradient.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(230, 240, 255)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(210, 225, 245))
-})
-headerGradient.Parent = headerFrame
-
-local headerPadding = Instance.new("UIPadding")
-headerPadding.PaddingLeft = UDim.new(0, 24)
-headerPadding.PaddingRight = UDim.new(0, 24)
-headerPadding.PaddingTop = UDim.new(0, 10)
-headerPadding.Parent = headerFrame
-
-local headerLabel = createLabel(headerFrame, SCRIPT_NAME, 28, "bold", COLORS.text)
-headerLabel.Size = UDim2.new(0.7, 0, 1, -10)
-headerLabel.Position = UDim2.new(0, 0, 0, 0)
-
-local versionLabel = createLabel(headerFrame, "v" .. SCRIPT_VERSION, 16, "medium", COLORS.textMuted)
-versionLabel.AnchorPoint = Vector2.new(1, 0)
-versionLabel.Position = UDim2.new(1, 0, 0, 4)
-versionLabel.Size = UDim2.new(0, 120, 0, 20)
-versionLabel.TextXAlignment = Enum.TextXAlignment.Right
-
-local keybindLabel = createLabel(headerFrame, "Press 'K' to toggle", 16, "medium", COLORS.textMuted)
-keybindLabel.AnchorPoint = Vector2.new(1, 1)
-keybindLabel.Position = UDim2.new(1, 0, 1, -8)
-keybindLabel.Size = UDim2.new(0, 180, 0, 20)
-keybindLabel.TextXAlignment = Enum.TextXAlignment.Right
-
--- Content Frame
-local contentFrame = Instance.new("Frame")
-contentFrame.Name = "Content"
-contentFrame.Size = UDim2.new(1, 0, 1 - headerHeight, -20)
-contentFrame.Position = UDim2.new(0, 0, headerHeight, 10)
-contentFrame.BackgroundTransparency = 1
-contentFrame.Parent = mainFrame
-
--- Left Settings Panel
-local leftPanel = Instance.new("Frame")
-leftPanel.Name = "SettingsPanel"
-leftPanel.AnchorPoint = Vector2.new(0, 0)
-leftPanel.Position = UDim2.new(0, 0, 0, 0)
-leftPanel.Size = UDim2.new(0.25, -10, 1, -10)
-leftPanel.BackgroundColor3 = COLORS.panel
-leftPanel.BackgroundTransparency = 0.1
-leftPanel.Parent = contentFrame
-applyCorner(leftPanel, 14)
-applyStroke(leftPanel, COLORS.accent, 1)
-
-local leftPadding = Instance.new("UIPadding")
-leftPadding.PaddingLeft = UDim.new(0, 16)
-leftPadding.PaddingRight = UDim.new(0, 12)
-leftPadding.PaddingTop = UDim.new(0, 16)
-leftPadding.PaddingBottom = UDim.new(0, 16)
-leftPadding.Parent = leftPanel
-
-local leftListLayout = Instance.new("UIListLayout")
-leftListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-leftListLayout.Padding = UDim.new(0, 12)
-leftListLayout.Parent = leftPanel
-
-local function createSectionTitle(parent, text)
-    local label = createLabel(parent, text, 20, "bold", COLORS.text)
-    label.Size = UDim2.new(1, 0, 0, 24)
-    return label
-end
-
-local function createToggle(parent, text, initial)
-    local container = Instance.new("Frame")
-    container.Name = text .. "Toggle"
-    container.Size = UDim2.new(1, 0, 0, 48)
-    container.BackgroundTransparency = 1
-    container.Parent = parent
-
-    local label = createLabel(container, text, 18, "medium", COLORS.text)
-    label.Size = UDim2.new(0.6, 0, 1, 0)
-
-    local button = Instance.new("TextButton")
-    button.Name = "ToggleButton"
-    button.AnchorPoint = Vector2.new(1, 0.5)
-    button.Position = UDim2.new(1, 0, 0.5, 0)
-    button.Size = UDim2.new(0, 68, 0, 28)
-    button.Text = ""
-    button.AutoButtonColor = false
-    button.BackgroundColor3 = Color3.fromRGB(210, 220, 235)
-    button.Parent = container
-    applyCorner(button, 14)
-
-    local knob = Instance.new("Frame")
-    knob.Name = "Knob"
-    knob.Size = UDim2.new(0, 24, 0, 24)
-    knob.Position = UDim2.new(0, 2, 0.5, -12)
-    knob.BackgroundColor3 = Color3.fromRGB(180, 190, 205)
-    knob.Parent = button
-    applyCorner(knob, 12)
-
-    local state = { value = initial == true }
-
-    local function applyVisual(animated)
-        local goalPosition = state.value and UDim2.new(1, -26, 0.5, -12) or UDim2.new(0, 2, 0.5, -12)
-        local knobColor = state.value and COLORS.green or Color3.fromRGB(180, 190, 205)
-        local buttonColor = state.value and Color3.fromRGB(200, 230, 220) or Color3.fromRGB(210, 220, 235)
-        if animated then
-            TweenService:Create(knob, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
-                Position = goalPosition,
-                BackgroundColor3 = knobColor
-            }):Play()
-            TweenService:Create(button, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
-                BackgroundColor3 = buttonColor
-            }):Play()
-        else
-            knob.Position = goalPosition
-            knob.BackgroundColor3 = knobColor
-            button.BackgroundColor3 = buttonColor
-        end
-    end
-
-    local function setValue(newValue, silent, animated)
-        local boolValue = newValue and true or false
-        if state.value ~= boolValue then
-            state.value = boolValue
-            applyVisual(animated ~= false)
-            if not silent and state.changed then
-                task.defer(state.changed, state.value)
-            end
-        else
-            applyVisual(animated ~= false)
-        end
-    end
-
-    state.set = function(_, newValue, silent)
-        setValue(newValue, silent, true)
-    end
-
-    state.get = function()
-        return state.value
-    end
-
-    applyVisual(false)
-
-    button.MouseButton1Click:Connect(function()
-        setValue(not state.value, false, true)
-    end)
-
-    return state
-end
-
-local function createTextBox(parent, labelText, placeholder, defaultText)
-    local container = Instance.new("Frame")
-    container.Name = labelText .. "Input"
-    container.Size = UDim2.new(1, 0, 0, 70)
-    container.BackgroundTransparency = 1
-    container.Parent = parent
-
-    local label = createLabel(container, labelText, 18, "medium", COLORS.text)
-    label.Size = UDim2.new(1, 0, 0, 24)
-
-    local box = Instance.new("TextBox")
-    box.Name = "InputBox"
-    box.Size = UDim2.new(1, 0, 0, 36)
-    box.Position = UDim2.new(0, 0, 0, 30)
-    box.Text = defaultText or ""
-    box.PlaceholderText = placeholder or ""
-    box.Font = Enum.Font.Gotham
-    box.TextColor3 = COLORS.text
-    box.TextSize = 16
-    box.BackgroundColor3 = Color3.fromRGB(240, 245, 250)
-    box.BackgroundTransparency = 0.15
-    box.ClearTextOnFocus = false
-    box.Parent = container
-    applyCorner(box, 10)
-    applyStroke(box, COLORS.accent, 1)
-
-    return box
-end
-
-local function createInfoLabel(parent, text)
-    local label = createLabel(parent, text, 16, "medium", COLORS.textMuted)
-    label.Size = UDim2.new(1, 0, 0, 20)
-    return label
-end
-
--- Settings UI
-createSectionTitle(leftPanel, "Automation")
-local autoJoinToggle = createToggle(leftPanel, "Auto Join", Config.autoJoin)
-local autoInjectToggle = createToggle(leftPanel, "Auto Inject", Config.autoInject)
-
-createSectionTitle(leftPanel, "Filters")
-local moneyFilterBox = createTextBox(leftPanel, "Minimum $/s", "e.g. 5m", tostring(Config.moneyFilter or "0"))
-local retryAmountBox = createTextBox(leftPanel, "Join Retry Amount", "0 = off", tostring(Config.retryAmount or 0))
-local whitelistBox = createTextBox(leftPanel, "Whitelist (CSV)", "name1,name2", table.concat(Config.whitelist or {}, ","))
-local blacklistBox = createTextBox(leftPanel, "Blacklist (CSV)", "name1,name2", table.concat(Config.blacklist or {}, ","))
-createInfoLabel(leftPanel, "Whitelist overrides blacklist when not empty.")
-
-local statusLabel = createLabel(leftPanel, "Status: Idle", 16, "medium", COLORS.textMuted)
-statusLabel.Size = UDim2.new(1, 0, 0, 20)
-statusLabel:SetAttribute("RetryCount", 0)
-
--- Right Panel (Server List)
-local rightPanel = Instance.new("Frame")
-rightPanel.Name = "ServerPanel"
-rightPanel.AnchorPoint = Vector2.new(1, 0)
-rightPanel.Position = UDim2.new(1, 0, 0, 0)
-rightPanel.Size = UDim2.new(0.73, 0, 1, -10)
-rightPanel.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-rightPanel.BackgroundTransparency = 0.08
-rightPanel.Parent = contentFrame
-applyCorner(rightPanel, 14)
-applyStroke(rightPanel, COLORS.accent, 1)
-
-local rightPadding = Instance.new("UIPadding")
-rightPadding.PaddingTop = UDim.new(0, 16)
-rightPadding.PaddingBottom = UDim.new(0, 16)
-rightPadding.PaddingLeft = UDim.new(0, 16)
-rightPadding.PaddingRight = UDim.new(0, 16)
-rightPadding.Parent = rightPanel
-
-local listTitle = createLabel(rightPanel, "Server Lobbies", 22, "bold", COLORS.text)
-listTitle.Size = UDim2.new(1, -120, 0, 28)
-
-local refreshInfo = createLabel(rightPanel, "Fetching...", 16, "medium", COLORS.textMuted)
-refreshInfo.AnchorPoint = Vector2.new(1, 0)
-refreshInfo.Position = UDim2.new(1, 0, 0, 4)
-refreshInfo.Size = UDim2.new(0, 140, 0, 20)
-refreshInfo.TextXAlignment = Enum.TextXAlignment.Right
-
-local serverList = Instance.new("ScrollingFrame")
-serverList.Name = "ServerList"
-serverList.Size = UDim2.new(1, 0, 1, -40)
-serverList.Position = UDim2.new(0, 0, 0, 34)
-serverList.BackgroundTransparency = 1
-serverList.BorderSizePixel = 0
-serverList.ScrollBarThickness = 8
-serverList.CanvasSize = UDim2.new()
-serverList.Parent = rightPanel
-
-local serverLayout = Instance.new("UIListLayout")
-serverLayout.SortOrder = Enum.SortOrder.LayoutOrder
-serverLayout.Padding = UDim.new(0, 10)
-serverLayout.Parent = serverList
-
-local function updateServerCanvas()
-    serverList.CanvasSize = UDim2.new(0, 0, 0, serverLayout.AbsoluteContentSize.Y + 8)
-end
-serverLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateServerCanvas)
-
--- NEW badge template
-local function createNewBadge(parent)
-    local badge = Instance.new("TextLabel")
-    badge.Name = "NewBadge"
-    badge.AnchorPoint = Vector2.new(1, 0)
-    badge.Position = UDim2.new(1, -90, 0, 6)
-    badge.Size = UDim2.new(0, 52, 0, 22)
-    badge.BackgroundColor3 = Color3.fromRGB(190, 230, 255)
-    badge.Text = "NEW"
-    badge.Font = Enum.Font.GothamBold
-    badge.TextColor3 = COLORS.blue
-    badge.TextSize = 14
-    badge.BackgroundTransparency = 0.1
-    badge.Parent = parent
-    applyCorner(badge, 10)
-    applyStroke(badge, COLORS.accent, 1)
-    return badge
-end
-
---//== Dragging ==//--
-local dragging = false
-local dragStart
-local startPos
-
-local function startDrag(input)
-    dragging = true
-    dragStart = input.Position
-    startPos = mainFrame.Position
-    input.Changed:Connect(function()
-        if input.UserInputState == Enum.UserInputState.End then
-            dragging = false
-        end
-    end)
-end
-
-local function updateDrag(input)
-    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-        local delta = input.Position - dragStart
-        mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-    end
-end
-
-headerFrame.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        startDrag(input)
-    end
-end)
-UIS.InputChanged:Connect(updateDrag)
-
---//== Visibility Toggle ==//--
-local uiVisible = true
-local function setUIVisible(visible, instant)
-    uiVisible = visible
-    if visible then
-        setBlur(true)
-        mainFrame.Visible = true
-        local goal = UDim2.new(0.5, -480, 0.5, -280)
-        if instant then
-            mainFrame.Position = goal
-            mainFrame.BackgroundTransparency = 0.15
-        else
-            mainFrame.Position = UDim2.new(0.5, -480, 0.5, -240)
-            mainFrame.BackgroundTransparency = 1
-            TweenService:Create(mainFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-                Position = goal,
-                BackgroundTransparency = 0.15
-            }):Play()
-        end
-    else
-        setBlur(false)
-        if instant then
-            mainFrame.Visible = false
-        else
-            local tween = TweenService:Create(mainFrame, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-                Position = UDim2.new(0.5, -480, 0.5, -220),
-                BackgroundTransparency = 1
-            })
-            tween.Completed:Connect(function()
-                mainFrame.Visible = false
-            end)
-            tween:Play()
-        end
-    end
-end
-
-UIS.InputBegan:Connect(function(input, gameProcessed)
-    if not gameProcessed and input.KeyCode == KEYBIND then
-        setUIVisible(not uiVisible, false)
-    end
-end)
-
-setUIVisible(true, true)
-
---//== Server Data Structures ==//--
-local servers = {}
-local cards = {}
-local pollingInterval = 0.2
-local lastPoll = 0
-local joinInProgress = false
-local retryTask
-local joinTargetJobId = nil
-local averageFrameDt = 0
-
-local function resetRetryState()
-    if retryTask then
-        retryTask:Disconnect()
-        retryTask = nil
-    end
-    joinInProgress = false
-    if statusLabel then
-        statusLabel:SetAttribute("RetryCount", 0)
-    end
-end
-
-local function parseLine(line)
-    local parts = {}
-    for segment in line:gmatch("([^|]+)") do
-        parts[#parts + 1] = segment:gsub("^%s+", ""):gsub("%s+$", ""):gsub("%*", "")
-    end
-    if #parts < 5 then
-        return {}
-    end
-    local results = {}
-    local index = 1
-    while index + 4 <= #parts do
-        local name = parts[index]
-        local moneyText = parts[index + 1]
-        local playersText = parts[index + 2]
-        local jobId = parts[index + 3]
-        local timestamp = parts[index + 4]
-        if name and jobId and #name > 0 and #jobId > 0 then
-            local current, maximum = playersText:match("(%d+)%s*/%s*(%d+)")
-            results[#results + 1] = {
-                name = name,
-                moneyPerSec = parseMoney(moneyText),
-                players = tonumber(current) or 0,
-                maxPlayers = tonumber(maximum) or 0,
-                jobId = jobId,
-                timestamp = parseTimestamp(timestamp),
-                rawMoney = moneyText,
-                rawPlayers = playersText
-            }
-        end
-        index = index + 5
-    end
-    return results
-end
-
-local function normalizeApiItem(item)
-    local jobId = tostring(item.jobId or item.id or "")
-    if jobId == "" then
-        return nil
-    end
-    local name = tostring(item.name or item.serverName or "")
-    local moneyField = tostring(item.moneyPerSec or item.money or item.money_per_second or item.moneyRate or item.moneyRatePerSec or item["money/s"] or "")
-    local playersField = tostring(item.players or item.playerCount or item.online or "")
-    local maxPlayersField = tonumber(item.maxPlayers or item.max or item.playerCap or 0) or 0
-    local timestampField = tostring(item.timestamp or item.time or "")
-
-    local players, maxPlayers = playersField:match("(%d+)%s*/%s*(%d+)")
-    local data = {
-        name = name,
-        moneyPerSec = parseMoney(moneyField),
-        players = tonumber(players) or tonumber(playersField) or 0,
-        maxPlayers = tonumber(maxPlayers) or tonumber(maxPlayersField) or 0,
-        jobId = jobId,
-        rawMoney = moneyField ~= "" and moneyField or formatMoneyShort(parseMoney(moneyField)),
-        rawPlayers = playersField ~= "" and playersField or string.format("%d/%d", tonumber(players) or tonumber(playersField) or 0, tonumber(maxPlayers) or tonumber(maxPlayersField) or 0),
-        timestamp = #timestampField > 0 and parseTimestamp(timestampField) or os.time()
-    }
-    return data
-end
-
-local function decodeResponse(body)
-    local list = {}
-    local ok, decoded = pcall(HttpService.JSONDecode, HttpService, body)
-    if ok and decoded then
-        if decoded.items and type(decoded.items) == "table" then
-            for _, item in ipairs(decoded.items) do
-                local data = normalizeApiItem(item)
-                if data then
-                    list[#list + 1] = data
-                end
-            end
-        elseif decoded.data and type(decoded.data) == "table" then
-            for _, item in ipairs(decoded.data) do
-                local data = normalizeApiItem(item)
-                if data then
-                    list[#list + 1] = data
-                end
-            end
-        elseif typeof(decoded) == "table" and #decoded > 0 then
-            for _, item in ipairs(decoded) do
-                local data = normalizeApiItem(item)
-                if data then
-                    list[#list + 1] = data
-                end
-            end
-        end
-    end
-
-    if #list > 0 then
-        return list
-    end
-
-    for line in body:gmatch("[^\r\n]+") do
-        local parsedEntries = parseLine(line)
-        for _, parsed in ipairs(parsedEntries) do
-            list[#list + 1] = parsed
-        end
-    end
-
-    return list
-end
-
-local function getRequestUrl()
-    local nonce = math.random(1, 10_000_000)
-    return string.format("%s/api/jobs?_cb=%d", DATA_ENDPOINT, nonce)
-end
-
-local function fetchServerData()
-    local success, body = safeRequest({
-        Url = getRequestUrl(),
-        Method = "GET",
-        Headers = {
-            ["x-api-key"] = DATA_API_KEY,
-            ["Accept"] = "application/json"
-        }
+-- ========= Save settings =========
+local function parseIgnore(s) local r={} for tok in (s or ""):gmatch("([^,%s]+)") do r[#r+1]=tok end return r end
+local function persist()
+    saveJSON(SETTINGS_PATH,{
+        AutoJoin=autoJoin.Value, AutoInject=autoInject.Value, IgnoreEnabled=ignoreToggle.Value,
+        JoinRetry=tonumber(jrBox.Text) or State.JoinRetry, MinMS=tonumber(msBox.Text) or State.MinMS,
+        IgnoreNames=parseIgnore(ignoreBox.Text)
     })
-    if not success or type(body) ~= "string" then
-        return false, {}
-    end
-    local entries = decodeResponse(body)
-    return true, entries
 end
+autoJoin.Changed=function(v) State.AutoJoin=v; persist() end
+ignoreToggle.Changed=function(v) State.IgnoreEnabled=v; persist() end
+jrBox.FocusLost:Connect(function() State.JoinRetry=tonumber(jrBox.Text) or State.JoinRetry; persist() end)
+msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; persist() end)
+ignoreBox.FocusLost:Connect(function() State.IgnoreNames=parseIgnore(ignoreBox.Text); persist() end)
 
---//== Filtering ==//--
-local function parseMoneyFilter()
-    local text = moneyFilterBox.Text
-    if text == nil or text == "" then
-        return 0
-    end
-    local cleaned = text:gsub("^%s+", ""):gsub("%s+$", "")
-    if cleaned == "" then
-        return 0
-    end
-    local value = parseMoney("$" .. cleaned .. "/s")
-    return value
+-- ========= AutoInject queue (robust) =========
+local autoInjectConn
+local function pickQueue()
+    local q
+    pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end)
+    if not q and type(queue_on_teleport)=="function" then q=queue_on_teleport end
+    if not q and type(queueteleport)=="function" then q=queueteleport end
+    if not q and type(fluxus)=="table" and type(fluxus.queue_on_teleport)=="function" then q=fluxus.queue_on_teleport end
+    return q
 end
-
-local function isWhitelisted(name)
-    if not name or name == "" then
-        return false
+local function makeBootstrap()
+    return "task.spawn(function() if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end; pcall(function() getgenv().__FLOPPA_UI_ACTIVE=nil end); local function g(u) for i=1,3 do local ok,r=pcall(function() return game:HttpGet(u) end); if ok and type(r)=='string' and #r>0 then return r end task.wait(1) end end; local s=g('"..AUTO_INJECT_URL.."'); if s then local f=loadstring(s); if f then pcall(f) end end end)"
+end
+local function queueReinject()
+    local q=pickQueue()
+    if q then
+        q(makeBootstrap())
+        print("[FloppaAJ] queued auto-inject payload on teleport")
+    else
+        warn("[FloppaAJ] no queue_on_teleport found in this executor")
     end
-    if Config.whitelist and #Config.whitelist > 0 then
-        for _, entry in ipairs(Config.whitelist) do
-            if name:lower() == entry:lower() then
-                return true
+end
+local function enableAutoInjectWatcher(enable)
+    if autoInjectConn then autoInjectConn:Disconnect(); autoInjectConn=nil end
+    if enable then
+        autoInjectConn = LocalPlayer.OnTeleport:Connect(function(state)
+            if state==Enum.TeleportState.Started or state==Enum.TeleportState.WaitingForServer or state==Enum.TeleportState.Connecting then
+                queueReinject()
             end
-        end
-        return false
-    end
-    return true
-end
-
-local function isBlacklisted(name)
-    if not name or name == "" then
-        return false
-    end
-    if Config.whitelist and #Config.whitelist > 0 then
-        return false
-    end
-    if Config.blacklist then
-        for _, entry in ipairs(Config.blacklist) do
-            if name:lower() == entry:lower() then
-                return true
-            end
-        end
-    end
-    return false
-end
-
-local function applyFilters(entry)
-    if entry.moneyPerSec < parseMoneyFilter() then
-        return false
-    end
-    if not isWhitelisted(entry.name) then
-        return false
-    end
-    if isBlacklisted(entry.name) then
-        return false
-    end
-    return true
-end
-
---//== Card Management ==//--
-local function createServerCard(entry)
-    local card = Instance.new("Frame")
-    card.Name = entry.jobId
-    card.Size = UDim2.new(1, -6, 0, 78)
-    card.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    card.BackgroundTransparency = 0.1
-    card.Parent = serverList
-    card.LayoutOrder = -entry.moneyPerSec
-    applyCorner(card, 12)
-    applyStroke(card, COLORS.accent, 1)
-
-    local padding = Instance.new("UIPadding")
-    padding.PaddingLeft = UDim.new(0, 14)
-    padding.PaddingRight = UDim.new(0, 14)
-    padding.PaddingTop = UDim.new(0, 10)
-    padding.PaddingBottom = UDim.new(0, 10)
-    padding.Parent = card
-
-    local nameLabel = createLabel(card, entry.name, 20, "bold", COLORS.text)
-    nameLabel.Size = UDim2.new(0.45, 0, 0, 24)
-
-    local moneyLabel = createLabel(card, entry.rawMoney or formatMoneyShort(entry.moneyPerSec), 18, "bold", Color3.fromRGB(60, 170, 90))
-    moneyLabel.AnchorPoint = Vector2.new(0, 0)
-    moneyLabel.Position = UDim2.new(0.46, 0, 0, 0)
-    moneyLabel.Size = UDim2.new(0.22, 0, 0, 24)
-
-    local playersLabel = createLabel(card, entry.rawPlayers or string.format("%d/%d", entry.players, entry.maxPlayers), 18, "medium", COLORS.blue)
-    playersLabel.AnchorPoint = Vector2.new(0, 0)
-    playersLabel.Position = UDim2.new(0.69, 0, 0, 0)
-    playersLabel.Size = UDim2.new(0.16, 0, 0, 24)
-
-    local joinButton = Instance.new("TextButton")
-    joinButton.Name = "JoinButton"
-    joinButton.AnchorPoint = Vector2.new(1, 0.5)
-    joinButton.Position = UDim2.new(1, -8, 0.5, 0)
-    joinButton.Size = UDim2.new(0, 92, 0, 36)
-    joinButton.Text = "JOIN"
-    joinButton.Font = Enum.Font.GothamBold
-    joinButton.TextColor3 = COLORS.text
-    joinButton.TextSize = 18
-    joinButton.AutoButtonColor = false
-    joinButton.BackgroundColor3 = COLORS.joinButton
-    joinButton.Parent = card
-    applyCorner(joinButton, 10)
-    applyStroke(joinButton, Color3.fromRGB(150, 210, 180), 1)
-
-    local badge = createNewBadge(card)
-    badge.Visible = true
-
-    cards[entry.jobId] = {
-        frame = card,
-        nameLabel = nameLabel,
-        moneyLabel = moneyLabel,
-        playersLabel = playersLabel,
-        button = joinButton,
-        badge = badge
-    }
-
-    joinButton.MouseButton1Click:Connect(function()
-        resetRetryState()
-        statusLabel.Text = "Status: Joining " .. entry.name
-        joinTargetJobId = entry.jobId
-        statusLabel:SetAttribute("RetryCount", 0)
-        local attempts = math.max(0, tonumber(retryAmountBox.Text) or Config.retryAmount or 0)
-        joinInProgress = true
-        local ok, err = pcall(function()
-            TeleportService:TeleportToPlaceInstance(PLACE_ID, entry.jobId, LOCAL_PLAYER)
         end)
-        if not ok then
-            displayBanner("Teleport failed: " .. tostring(err), 3)
-            if attempts == 0 then
-                resetRetryState()
+        queueReinject() -- сразу положим на случай мгновенного телепорта
+    end
+end
+autoInject.Changed=function(v) State.AutoInject=v; persist(); enableAutoInjectWatcher(v) end
+enableAutoInjectWatcher(State.AutoInject)
+persist()
+
+-- ========= Networking =========
+local function getReqFn() return (syn and syn.request) or http_request or request or (fluxus and fluxus.request) or nil end
+local function apiGetJSON(limit)
+    local req = getReqFn()
+    local url = string.format("%s/api/jobs?limit=%d&_cb=%d", SERVER_BASE, limit or 200, math.random(10^6,10^7))
+    if req then
+        local res = req({ Url = url, Method = "GET", Headers = { ["x-api-key"]=API_KEY, ["Accept"]="application/json" } })
+        if res and res.StatusCode == 200 and type(res.Body)=="string" then
+            local ok, data = pcall(function() return HttpService:JSONDecode(res.Body) end)
+            if ok then return true, data end
+        end
+        url = url .. "&key=" .. API_KEY
+    end
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if not ok or type(body)~="string" or #body==0 then return false end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not ok2 then return false end
+    return true, data
+end
+
+-- ========= Money & filters =========
+local mult={K=1e3,M=1e6,B=1e9,T=1e12}
+local function parseMoneyStr(s)
+    s=tostring(s or ""):gsub(",", ""):upper()
+    local num,unit=s:match("%$%s*([%d%.]+)%s*([KMBT]?)%s*/%s*[Ss]") ; if not num then num,unit=s:match("%$%s*([%d%.]+)%s*([KMBT]?)") end
+    if not num then return 0 end
+    return math.floor((tonumber(num) or 0) * (mult[unit or ""] or 1) + 0.5)
+end
+local function minThreshold() return (tonumber(msBox.Text) or State.MinMS or 0) * 1e6 end
+local function passFilters(d)
+    if d.mps < minThreshold() then return false end
+    if ignoreToggle.Value and #State.IgnoreNames>0 then
+        for _,nm in ipairs(State.IgnoreNames) do if #nm>0 and d.name:lower():find(nm:lower(),1,true) then return false end end
+    end
+    return true
+end
+
+-- ========= Entries & UI items =========
+local Entries, Order = {}, {}
+local SeenHashes = {}
+local function hashOf(item) return string.format("%s|%s|%s", item.jobId or "", item.moneyStr or "", item.playersRaw or "") end
+local function playersFmt(p,m) return string.format("%d/%d", p or 0, m or 0) end
+
+local function ensureItem(jobId, data)
+    local e=Entries[jobId]; if e and e.frame then return e.frame end
+    local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel; item.Parent=scroll; roundify(item,10); stroke(item,COLORS.purpleSoft,1,0.35); padding(item,12,6,12,6)
+    local nameLbl=mkLabel(item, string.upper(data.name), 18, "bold", COLORS.textPrimary); nameLbl.Size=UDim2.new(0.44,-10,1,0)
+    local moneyLbl=mkLabel(item, string.upper(data.moneyStr or ""), 17, "medium", Color3.fromRGB(130,255,130)); moneyLbl.AnchorPoint=Vector2.new(0,0.5); moneyLbl.Position=UDim2.new(0.46,0,0.5,0); moneyLbl.Size=UDim2.new(0.22,0,1,0); moneyLbl.TextXAlignment=Enum.TextXAlignment.Left
+    local playersLbl=mkLabel(item, playersFmt(data.curPlayers,data.maxPlayers), 16, "medium", COLORS.textWeak); playersLbl.AnchorPoint=Vector2.new(0,0.5); playersLbl.Position=UDim2.new(0.69,0,0.5,0); playersLbl.Size=UDim2.new(0.12,0,1,0); playersLbl.TextXAlignment=Enum.TextXAlignment.Left
+    local joinBtn=Instance.new("TextButton"); joinBtn.Text="JOIN"; setFont(joinBtn,"bold"); joinBtn.TextSize=18; joinBtn.TextColor3=Color3.fromRGB(22,22,22); joinBtn.AutoButtonColor=true; joinBtn.BackgroundColor3=COLORS.joinBtn; joinBtn.Size=UDim2.new(0,84,0,36); joinBtn.AnchorPoint=Vector2.new(1,0.5); joinBtn.Position=UDim2.new(1,-8,0.5,0); roundify(joinBtn,10); stroke(joinBtn,Color3.fromRGB(0,0,0),1,0.7); joinBtn.Parent=item
+
+    -- === JOIN RETRY + logging ===
+    joinBtn.MouseButton1Click:Connect(function()
+        local maxRetries = tonumber(jrBox.Text) or State.JoinRetry or 0
+        local attempts   = 0
+        local active     = true
+
+        local function backoff(n) return math.min(2.0, 0.25 * (2 ^ math.max(n-1,0))) end
+        local retryable = {
+            [Enum.TeleportResult.GameFull] = true,
+            [Enum.TeleportResult.Failure]  = true,
+            [Enum.TeleportResult.Timeout]  = true,
+            [Enum.TeleportResult.ServiceUnavailable] = true,
+        }
+
+        joinBtn.AutoButtonColor = false
+        joinBtn.Active = false
+        joinBtn.Text = "JOIN…"
+
+        local connInitFail, connTeleState, connTeleOnce
+        local function cleanup(finalText)
+            if not active then return end
+            active = false
+            if connInitFail then connInitFail:Disconnect() end
+            if connTeleState then connTeleState:Disconnect() end
+            if connTeleOnce then connTeleOnce:Disconnect() end
+            joinBtn.Text = finalText or "JOIN"
+            task.delay(0.25, function() if joinBtn then joinBtn.AutoButtonColor = true; joinBtn.Active = true end end)
+        end
+
+        local function attemptTeleport()
+            if not active then return end
+            attempts += 1
+            local label = (attempts==1) and "JOIN…" or string.format("RETRY %d/%d", attempts-1, maxRetries)
+            joinBtn.Text = label
+            print(string.format("[FloppaAJ] join try %d/%d -> TeleportToPlaceInstance(%d, %s)", attempts-1, maxRetries, TARGET_PLACE_ID, tostring(jobId)))
+            pcall(function() TeleportService:TeleportToPlaceInstance(TARGET_PLACE_ID, jobId, LocalPlayer) end)
+
+            local thisAttempt = attempts
+            task.delay(6.0, function()
+                if not active then return end
+                if attempts == thisAttempt then
+                    if (attempts-1) >= maxRetries then
+                        warn("[FloppaAJ] join timeout, retries exhausted"); cleanup("TIMEOUT")
+                    else
+                        warn(string.format("[FloppaAJ] join watchdog retry %d/%d", attempts, maxRetries))
+                        task.delay(backoff(attempts), attemptTeleport)
+                    end
+                end
+            end)
+        end
+
+        connInitFail = TeleportService.TeleportInitFailed:Connect(function(player, result, placeId, options)
+            if not active or player ~= LocalPlayer then return end
+            warn(string.format("[FloppaAJ] TeleportInitFailed: %s (placeId=%s) on try %d/%d",
+                (typeof(result)=="EnumItem" and result.Name) or tostring(result), tostring(placeId), attempts-1, maxRetries))
+            if retryable[result] then
+                if (attempts-1) >= maxRetries then cleanup("GAVE UP") else task.delay(backoff(attempts+1), attemptTeleport) end
+            else
+                cleanup("FAILED")
+            end
+        end)
+
+        connTeleState = LocalPlayer.OnTeleport:Connect(function(state)
+            if not active then return end
+            if state == Enum.TeleportState.Failed then
+                warn(string.format("[FloppaAJ] OnTeleport state=Failed on try %d/%d", attempts-1, maxRetries))
+                if (attempts-1) >= maxRetries then cleanup("FAILED") else task.delay(backoff(attempts+1), attemptTeleport) end
+            end
+        end)
+
+        connTeleOnce = LocalPlayer.OnTeleport:Once(function(state)
+            if state == Enum.TeleportState.Started then
+                print(string.format("[FloppaAJ] teleport started on try %d/%d — success", attempts-1, maxRetries))
+                cleanup("OK")
+            end
+        end)
+
+        attemptTeleport()
+    end)
+
+    Entries[jobId]={data=data, frame=item, firstSeen=os.clock(), lastSeen=os.clock(), refs={nameLbl=nameLbl, moneyLbl=moneyLbl, playersLbl=playersLbl}}
+    return item
+end
+
+local function updateItem(jobId, data)
+    local e=Entries[jobId]
+    if not e then ensureItem(jobId, data); table.insert(Order, jobId); e=Entries[jobId]
+    else
+        if data.mps > (e.data.mps or 0) then e.data = data end
+        e.lastSeen = os.clock()
+    end
+    local r=e.refs; if r then r.nameLbl.Text=string.upper(e.data.name); r.moneyLbl.Text=string.upper(e.data.moneyStr or ""); r.playersLbl.Text=playersFmt(e.data.curPlayers,e.data.maxPlayers) end
+end
+local function removeItem(jobId)
+    local e=Entries[jobId]; if not e then return end
+    if e.frame then pcall(function() e.frame:Destroy() end) end
+    Entries[jobId]=nil; for i=#Order,1,-1 do if Order[i]==jobId then table.remove(Order,i) break end end
+end
+local function resortPaint()
+    table.sort(Order,function(a,b) local ea,eb=Entries[a],Entries[b]; if not ea or not eb then return (a or "")<(b or "") end; if ea.data.mps~=eb.data.mps then return ea.data.mps>eb.data.mps end; return ea.lastSeen>eb.lastSeen end)
+    local shown=0
+    for idx,id in ipairs(Order) do
+        local e=Entries[id]; if e and e.frame then
+            e.frame.LayoutOrder=idx; local age=os.clock()-e.firstSeen
+            if age<=FRESH_AGE_SEC then e.frame.BackgroundColor3=Color3.fromRGB(22,28,26); e.frame.BackgroundTransparency=ALPHA.panel
+            else e.frame.BackgroundColor3=COLORS.surface; local st=math.clamp((os.clock()-e.lastSeen)/ENTRY_TTL_SEC,0,1); e.frame.BackgroundTransparency=ALPHA.panel+0.05*st end
+            shown+=1
+        end
+    end
+    local minM=tonumber(msBox.Text) or State.MinMS or 0
+    statsLbl.Text=string.format("shown: %d • min: %dM/s", shown, minM)
+    task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
+end
+
+-- ========= Pull loop (FIRST FILL) =========
+local function pickBestByServer(items)
+    local bestById={}
+    for _,it in ipairs(items) do
+        local id   = tostring(it.id or it.job_id or "")
+        local name = tostring(it.name or "")
+        local moneyStr = tostring(it.money_per_second or it.money or "")
+        local players  = tostring(it.players or "")
+        if id~="" and name~="" and moneyStr~="" and players~="" then
+            local cur,max = players:match("(%d+)%s*/%s*(%d+)")
+            cur=tonumber(cur or 0) or 0; max=tonumber(max or 0) or 0
+            local mps=parseMoneyStr(moneyStr)
+            local item={jobId=id,name=name,moneyStr=moneyStr,mps=mps,curPlayers=cur,maxPlayers=max,playersRaw=players}
+            if passFilters(item) then
+                local curBest=bestById[id]
+                if (not curBest) or (item.mps>curBest.mps) then bestById[id]=item end
             end
         end
-        if attempts > 0 then
-            local accumulated = 0
-            retryTask = RunService.Heartbeat:Connect(function(dt)
-                if not joinInProgress then
-                    resetRetryState()
-                    return
-                end
-                accumulated = accumulated + dt
-                while accumulated >= RETRY_DELAY do
-                    accumulated = accumulated - RETRY_DELAY
-                    local attemptNumber = (statusLabel:GetAttribute("RetryCount") or 0) + 1
-                    statusLabel:SetAttribute("RetryCount", attemptNumber)
-                    showConsole(string.format("join retry %d/%d", attemptNumber, attempts))
-                    local ok2, err2 = pcall(function()
-                        TeleportService:TeleportToPlaceInstance(PLACE_ID, entry.jobId, LOCAL_PLAYER)
-                    end)
-                    if ok2 then
-                        resetRetryState()
-                        return
-                    elseif attemptNumber >= attempts then
-                        displayBanner("Join retries exhausted", 2.5)
-                        resetRetryState()
-                        return
-                    elseif err2 then
-                        -- if server full keep trying until attempts reached
-                        if tostring(err2):lower():find("full") then
-                            -- continue loop
+    end
+    return bestById
+end
+
+local wantImmediate = false
+refreshBtn.MouseButton1Click:Connect(function() wantImmediate = true end)
+
+task.spawn(function()
+    local lastTick = 0
+    while gui and gui.Parent do
+        local now=os.clock()
+        if wantImmediate or (now - lastTick) >= PULL_INTERVAL_SEC then
+            wantImmediate=false
+            lastTick = now
+
+            local ok, data = apiGetJSON(250)
+            if ok and type(data)=="table" and type(data.items)=="table" then
+                local best = pickBestByServer(data.items)
+                local anyChanged=false
+                local added=0
+
+                for _, d in pairs(best) do
+                    local h = hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})
+                    if not SeenHashes[h] then
+                        SeenHashes[h]=true
+                        updateItem(d.jobId, d)   -- рисуем сразу
+                        anyChanged=true
+                        added += 1
+                    else
+                        if Entries[d.jobId] then
+                            Entries[d.jobId].data.curPlayers=d.curPlayers
+                            Entries[d.jobId].data.maxPlayers=d.maxPlayers
+                            Entries[d.jobId].lastSeen=os.clock()
                         end
                     end
                 end
-            end)
-        end
-    end)
 
-    return card
-end
-
-local function updateServerCard(entry)
-    local card = cards[entry.jobId]
-    if not card then
-        return createServerCard(entry)
-    end
-    card.nameLabel.Text = entry.name
-    card.moneyLabel.Text = entry.rawMoney or formatMoneyShort(entry.moneyPerSec)
-    card.playersLabel.Text = entry.rawPlayers or string.format("%d/%d", entry.players, entry.maxPlayers)
-    card.frame.LayoutOrder = -entry.moneyPerSec
-    if card.badge then
-        card.badge.Visible = os.clock() - entry.firstSeen < NEW_BADGE_SECONDS
-    end
-    return card.frame
-end
-
-local function removeServerCard(jobId)
-    local card = cards[jobId]
-    if card then
-        if card.frame then
-            TweenService:Create(card.frame, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
-                BackgroundTransparency = 1,
-                Size = UDim2.new(card.frame.Size.X.Scale, card.frame.Size.X.Offset, 0, 0)
-            }):Play()
-            task.delay(0.25, function()
-                if card.frame then
-                    card.frame:Destroy()
+                for id,e in pairs(Entries) do
+                    if (os.clock()-e.lastSeen) > ENTRY_TTL_SEC then removeItem(id); anyChanged=true end
                 end
-            end)
-        end
-        cards[jobId] = nil
-    end
-end
 
---//== Auto Inject ==//--
-local function getQueueFunction()
-    if syn and syn.queue_on_teleport then
-        return syn.queue_on_teleport
-    end
-    if queue_on_teleport then
-        return queue_on_teleport
-    end
-    if fluxus and fluxus.queue_on_teleport then
-        return fluxus.queue_on_teleport
-    end
-    if queueteleport then
-        return queueteleport
-    end
-    return nil
-end
-
-local function queueAutoInject()
-    local fn = getQueueFunction()
-    if not fn then
-        return
-    end
-    local scriptText = string.format([[task.defer(function()
-        local function safeGet(url)
-            for i = 1, 3 do
-                local ok, result = pcall(function()
-                    return game:HttpGet(url)
-                end)
-                if ok and type(result) == "string" and #result > 0 then
-                    return result
-                end
-                task.wait(1)
-            end
-            return nil
-        end
-        local src = safeGet("%s")
-        if src then
-            local f = loadstring(src)
-            if f then
-                pcall(f)
-            end
-        end
-    end)
-    ]], AUTO_INJECT_URL)
-    fn(scriptText)
-end
-
-if Config.autoInject then
-    queueAutoInject()
-end
-
-LOCAL_PLAYER.OnTeleport:Connect(function(state)
-    if state == Enum.TeleportState.Started then
-        if Config.autoInject then
-            queueAutoInject()
-        end
-        if Config.autoJoin then
-            Config.autoJoin = false
-            resetAutoJoin()
-            autoJoinToggle:set(false, true)
-            saveConfig(Config)
-        end
-        resetRetryState()
-    end
-end)
-
---//== Auto Join Logic ==//--
-local seenJobIds = {}
-local function resetAutoJoin()
-    seenJobIds = {}
-    joinTargetJobId = nil
-end
-
-local function pickBestServer()
-    local sorted = {}
-    for _, entry in pairs(servers) do
-        if applyFilters(entry) then
-            sorted[#sorted + 1] = entry
-        end
-    end
-    table.sort(sorted, function(a, b)
-        if math.abs(a.firstSeen - b.firstSeen) < 0.001 then
-            if a.moneyPerSec ~= b.moneyPerSec then
-                return a.moneyPerSec > b.moneyPerSec
-            end
-            return a.name < b.name
-        end
-        return a.firstSeen > b.firstSeen
-    end)
-    if #sorted == 0 then
-        return nil
-    end
-    for _, entry in ipairs(sorted) do
-        if not seenJobIds[entry.jobId] then
-            return entry
-        end
-    end
-    return sorted[1]
-end
-
-local function attemptAutoJoin()
-    if not Config.autoJoin or joinInProgress then
-        return
-    end
-    local candidate = pickBestServer()
-    if not candidate then
-        return
-    end
-
-    resetRetryState()
-    seenJobIds[candidate.jobId] = true
-    joinTargetJobId = candidate.jobId
-    statusLabel.Text = "Status: Auto joining " .. candidate.name
-    statusLabel:SetAttribute("RetryCount", 0)
-    joinInProgress = true
-    local success, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(PLACE_ID, candidate.jobId, LOCAL_PLAYER)
-    end)
-    if not success then
-        displayBanner("Auto join failed: " .. tostring(err), 3)
-    end
-    local attempts = math.max(0, Config.retryAmount or 0)
-    if not success and attempts == 0 then
-        resetRetryState()
-    end
-    if attempts > 0 then
-        joinInProgress = true
-        local accumulated = 0
-        retryTask = RunService.Heartbeat:Connect(function(dt)
-            if not joinInProgress then
-                resetRetryState()
-                return
-            end
-            accumulated = accumulated + dt
-            while accumulated >= RETRY_DELAY do
-                accumulated = accumulated - RETRY_DELAY
-                local attemptIndex = (statusLabel:GetAttribute("RetryCount") or 0) + 1
-                statusLabel:SetAttribute("RetryCount", attemptIndex)
-                showConsole(string.format("join retry %d/%d", attemptIndex, attempts))
-                local ok = pcall(function()
-                    TeleportService:TeleportToPlaceInstance(PLACE_ID, candidate.jobId, LOCAL_PLAYER)
-                end)
-                if ok then
-                    resetRetryState()
-                    if Config.autoJoin then
-                        Config.autoJoin = false
-                        autoJoinToggle:set(false, true)
-                        saveConfig(Config)
-                    end
-                    return
-                elseif attemptIndex >= attempts then
-                    displayBanner("Auto join retries exhausted", 2.5)
-                    resetRetryState()
-                    return
-                end
-            end
-        end)
-    end
-end
-
-TeleportService.TeleportInitFailed:Connect(function(player, result, message)
-    if player ~= LOCAL_PLAYER then
-        return
-    end
-    resetRetryState()
-    displayBanner("Teleport failed: " .. tostring(message), 2.5)
-end)
-
-LogService.MessageOut:Connect(function(text)
-    if not joinInProgress then
-        return
-    end
-    local lowered = string.lower(text)
-    if lowered:find("teleport") and lowered:find("failed") then
-        displayBanner(text, 2.5)
-        if lowered:find("gameended") or lowered:find("could not find") or lowered:find("game instance") then
-            resetRetryState()
-        end
-    end
-end)
-
-RunService.Heartbeat:Connect(function()
-    statusLabel.Text = joinInProgress and "Status: Teleporting..." or (Config.autoJoin and "Status: Auto Join on" or "Status: Idle")
-end)
-
-RunService.Heartbeat:Connect(function(dt)
-    if dt > 0 then
-        if averageFrameDt == 0 then
-            averageFrameDt = dt
-        else
-            averageFrameDt = averageFrameDt * 0.9 + dt * 0.1
-        end
-    end
-end)
-
---//== Data Polling ==//--
-local consecutiveErrors = 0
-
-local function refreshServers()
-    if os.clock() - lastPoll < pollingInterval then
-        return
-    end
-    lastPoll = os.clock()
-    refreshInfo.Text = "Refreshing..."
-    local success, entries = fetchServerData()
-    if not success then
-        consecutiveErrors = consecutiveErrors + 1
-        displayBanner("Network error, retrying...", 2)
-        pollingInterval = math.min(POLL_MAX_INTERVAL, pollingInterval + 0.1 * consecutiveErrors)
-        return
-    end
-
-    consecutiveErrors = 0
-    refreshInfo.Text = string.format("Last update: %s", os.date("%H:%M:%S"))
-
-    local currentTime = os.time()
-    local seenThisCycle = {}
-
-    for _, entry in ipairs(entries) do
-        if entry.jobId and entry.jobId ~= "" then
-            local key = entry.jobId
-            local existing = servers[key]
-            if existing then
-                entry.firstSeen = existing.firstSeen
+                if anyChanged then task.defer(resortPaint) end
+                print(string.format("[FloppaAJ] fetched %d, added %d, shown %d", #data.items, added, #Order))
             else
-                entry.firstSeen = os.clock()
-            end
-            entry.lastSeen = os.clock()
-            servers[key] = entry
-            seenThisCycle[key] = true
-            if applyFilters(entry) then
-                updateServerCard(entry)
-            else
-                removeServerCard(key)
+                warn("[FloppaAJ] apiGetJSON failed or returned empty items")
             end
         end
+        task.wait(0.05)
     end
+end)
 
-    for jobId, data in pairs(servers) do
-        if not seenThisCycle[jobId] then
-            local serverAge = math.max(0, currentTime - (data.timestamp or currentTime))
-            local localAge = os.clock() - (data.lastSeen or os.clock())
-            if serverAge > ENTRY_TTL_SECONDS or localAge > ENTRY_TTL_SECONDS then
-                servers[jobId] = nil
-                removeServerCard(jobId)
-            end
+-- ========= Show/Hide & Drag (hotkey robust) =========
+local function makeDraggable(frame, handle)
+    handle=handle or frame; local dragging=false; local startPos; local startMouse
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 then
+            dragging=true; startPos=frame.Position; startMouse=input.Position
+            input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end)
         end
-    end
-
-    local sortedCards = {}
-    for jobId, entry in pairs(servers) do
-        if applyFilters(entry) then
-            sortedCards[#sortedCards + 1] = entry
-        else
-            removeServerCard(jobId)
-        end
-    end
-    table.sort(sortedCards, function(a, b)
-        if a.moneyPerSec ~= b.moneyPerSec then
-            return a.moneyPerSec > b.moneyPerSec
-        end
-        return a.firstSeen > b.firstSeen
     end)
-
-    for index, entry in ipairs(sortedCards) do
-        local card = cards[entry.jobId]
-        if card and card.frame then
-            card.frame.LayoutOrder = index
-            if card.badge then
-                card.badge.Visible = os.clock() - entry.firstSeen < NEW_BADGE_SECONDS
-            end
+    UIS.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType==Enum.UserInputType.MouseMovement then
+            local d=input.Position-startMouse
+            frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
         end
-    end
-
-    if Config.autoJoin then
-        attemptAutoJoin()
-    end
+    end)
 end
 
--- Poll loop
-task.spawn(function()
-    while screenGui.Parent do
-        if averageFrameDt > 0 then
-            local currentFps = 1 / averageFrameDt
-            if currentFps < TARGET_FPS_MIN then
-                pollingInterval = math.min(POLL_MAX_INTERVAL, pollingInterval + 0.02)
-            elseif currentFps > TARGET_FPS_MAX then
-                pollingInterval = math.max(POLL_MIN_INTERVAL, pollingInterval - 0.01)
-            end
-        end
-        pollingInterval = math.clamp(pollingInterval, POLL_MIN_INTERVAL, POLL_MAX_INTERVAL)
-        refreshServers()
-        task.wait(pollingInterval)
-    end
-end)
-
--- UI updates for TTL fade
-task.spawn(function()
-    while screenGui.Parent do
-        for jobId, entry in pairs(servers) do
-            local card = cards[jobId]
-            if card and card.badge then
-                card.badge.Visible = os.clock() - entry.firstSeen < NEW_BADGE_SECONDS
-            end
-        end
-        task.wait(0.1)
-    end
-end)
-
---//== Input Handling for Settings ==//--
-local function sanitizeNonNegativeNumber(text)
-    local value = tonumber(text) or 0
-    if value < 0 then
-        displayBanner("Negative values are clamped to 0", 2)
-    end
-    value = math.max(0, value)
-    return value
-end
-
-moneyFilterBox.FocusLost:Connect(function()
-    local value = moneyFilterBox.Text or ""
-    if type(value) ~= "string" then
-        value = ""
-    end
-    local trimmed = value:gsub("^%s+", ""):gsub("%s+$", "")
-    if trimmed == "" then
-        trimmed = "0"
-    end
-    moneyFilterBox.Text = trimmed
-    Config.moneyFilter = trimmed
-    saveConfig(Config)
-    refreshServers()
-end)
-
-retryAmountBox.FocusLost:Connect(function()
-    local sanitized = sanitizeNonNegativeNumber(retryAmountBox.Text)
-    Config.retryAmount = sanitized
-    retryAmountBox.Text = tostring(sanitized)
-    saveConfig(Config)
-end)
-
-whitelistBox.FocusLost:Connect(function()
-    Config.whitelist = splitCSV(whitelistBox.Text)
-    saveConfig(Config)
-    resetAutoJoin()
-    refreshServers()
-end)
-
-blacklistBox.FocusLost:Connect(function()
-    Config.blacklist = splitCSV(blacklistBox.Text)
-    saveConfig(Config)
-    resetAutoJoin()
-    refreshServers()
-end)
-
-autoJoinToggle.changed = function(value)
-    Config.autoJoin = value
-    if value then
-        resetAutoJoin()
-        for jobId in pairs(servers) do
-            seenJobIds[jobId] = true
-        end
+local opened=true
+local function setVisible(v,inst)
+    opened=v
+    if v then setBlur(true) else setBlur(false) end
+    local goal=v and UDim2.new(0.5,-490,0.5,-280) or UDim2.new(0.5,-490,1,30)
+    if inst then main.Position=goal; main.Visible=v
     else
-        resetAutoJoin()
-        resetRetryState()
+        if v then main.Visible=true end
+        local t=TweenService:Create(main,TweenInfo.new(0.18,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Position=goal})
+        t:Play()
+        if not v then t.Completed:Wait(); main.Visible=false end
     end
-    saveConfig(Config)
 end
 
-autoInjectToggle.changed = function(value)
-    Config.autoInject = value
-    if value then
-        queueAutoInject()
+-- приоритетный бинд (работает даже при gameProcessed=true)
+local function toggleAction(_, inputState, inputObj)
+    if inputState == Enum.UserInputState.Begin then
+        setVisible(not opened,false)
     end
-    saveConfig(Config)
+    return Enum.ContextActionResult.Sink
+end
+local okBind = pcall(function()
+    if CAS.BindActionAtPriority then
+        CAS:BindActionAtPriority("FloppaToggle", toggleAction, false, 2000, FIXED_HOTKEY)
+    else
+        CAS:BindAction("FloppaToggle", toggleAction, false, FIXED_HOTKEY)
+    end
+end)
+if not okBind then
+    -- запасной вариант
+    UIS.InputBegan:Connect(function(input) if input.KeyCode==FIXED_HOTKEY then setVisible(not opened,false) end end)
 end
 
--- refresh once at start
-refreshServers()
+UIS.InputBegan:Connect(function(input) if input.KeyCode == Enum.KeyCode.Escape then if opened then setVisible(false,false) end end end)
+closeBtn.MouseButton1Click:Connect(function() setVisible(false,false) end)
+
+makeDraggable(main, header)
+task.defer(function() setVisible(true,true) end)
+
+-- (опционально) тестовая карточка:
+-- ensureItem("debug-job", {name="DEBUG LOBBY", moneyStr="$2M/s", mps=2e6, curPlayers=0, maxPlayers=12, playersRaw="0/12"})
