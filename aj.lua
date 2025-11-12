@@ -8,7 +8,7 @@
   • Auto Join с retry функционалом
 ]]
 
-local SCRIPT_VERSION = "4.0"
+local SCRIPT_VERSION = "5.0"
 
 ------------------ USER SETTINGS ------------------
 local AUTO_INJECT_URL = "https://raw.githubusercontent.com/windyx12193/Floppa/main/aj.lua"
@@ -189,12 +189,33 @@ local header=Instance.new("Frame"); header.Size=UDim2.new(1,0,0,48); header.Back
 roundify(header,10); stroke(header); padding(header,14,6,14,6)
 local titleLabel=mkLabel(header,"FLOPPA AUTO JOINER",20,"bold",COLORS.textPrimary)
 titleLabel.Size=UDim2.new(0.5,0,1,0)
-local versionLabel=mkLabel(header,"v"..SCRIPT_VERSION,12,"medium",COLORS.purpleSoft)
-versionLabel.Position=UDim2.new(0,180,0,0)
-versionLabel.Size=UDim2.new(0,50,1,0)
-versionLabel.TextXAlignment=Enum.TextXAlignment.Left
 local hotkeyInfo=mkLabel(header,"OPEN GUI KEY:  T",16,"medium",COLORS.textWeak)
 hotkeyInfo.AnchorPoint=Vector2.new(1,0.5); hotkeyInfo.Position=UDim2.new(1,-14,0.5,0); hotkeyInfo.Size=UDim2.new(0.35,0,1,0); hotkeyInfo.TextXAlignment=Enum.TextXAlignment.Right
+
+-- Version badge в правом верхнем углу окна
+local versionBadge=Instance.new("Frame")
+versionBadge.Name="VersionBadge"
+versionBadge.Size=UDim2.new(0,65,0,26)
+versionBadge.Position=UDim2.new(1,-75,0,8)
+versionBadge.AnchorPoint=Vector2.new(1,0)
+versionBadge.BackgroundColor3=COLORS.purpleDeep
+versionBadge.BackgroundTransparency=0
+versionBadge.Parent=main
+roundify(versionBadge,6)
+stroke(versionBadge, COLORS.purple, 1.5, 0.2)
+-- Градиент для версии
+local versionGradient=Instance.new("UIGradient")
+versionGradient.Color=ColorSequence.new{
+    ColorSequenceKeypoint.new(0,COLORS.purpleDeep),
+    ColorSequenceKeypoint.new(1,COLORS.purple)
+}
+versionGradient.Rotation=45
+versionGradient.Parent=versionBadge
+local versionText=mkLabel(versionBadge,"v"..SCRIPT_VERSION,13,"bold",Color3.new(1,1,1))
+versionText.Size=UDim2.new(1,0,1,0)
+versionText.TextXAlignment=Enum.TextXAlignment.Center
+versionText.TextYAlignment=Enum.TextYAlignment.Center
+versionText.ZIndex=2
 
 -- Left / Right columns
 local left=Instance.new("ScrollingFrame"); left.Size=UDim2.new(0,300,1,-58); left.Position=UDim2.new(0,0,0,58); left.BackgroundTransparency=1
@@ -358,48 +379,73 @@ local function fetchServerData()
         end
         
         -- Пробуем разные способы HTTP запросов
+        local responseBody = nil
+        
+        -- Способ 1: syn.request
         if syn and syn.request then
-            local response = syn.request({
-                Url = API_URL,
-                Method = "GET",
-                Headers = headers
-            })
-            if response and response.Body and type(response.Body) == "string" then
-                return response.Body
-            end
-        elseif request then
-            local response = request({
-                Url = API_URL,
-                Method = "GET",
-                Headers = headers
-            })
-            if response and response.Body and type(response.Body) == "string" then
-                return response.Body
-            end
-        elseif HttpService and HttpService.RequestAsync then
-            local response = HttpService:RequestAsync({
-                Url = API_URL,
-                Method = "GET",
-                Headers = headers
-            })
-            if response and response.Body and type(response.Body) == "string" then
-                return response.Body
-            end
-        elseif game.HttpGet then
-            -- Правильный вызов HttpGet
-            local success, body = pcall(function()
-                return game:HttpGet(API_URL, true, headers)
+            local success, response = pcall(function()
+                return syn.request({
+                    Url = API_URL,
+                    Method = "GET",
+                    Headers = headers
+                })
             end)
-            if success and body and type(body) == "string" then
-                return body
+            if success and response and response.Body and type(response.Body) == "string" and #response.Body > 0 then
+                responseBody = response.Body
             end
         end
-        return nil
+        
+        -- Способ 2: request (другие executors)
+        if not responseBody and request then
+            local success, response = pcall(function()
+                return request({
+                    Url = API_URL,
+                    Method = "GET",
+                    Headers = headers
+                })
+            end)
+            if success and response and response.Body and type(response.Body) == "string" and #response.Body > 0 then
+                responseBody = response.Body
+            end
+        end
+        
+        -- Способ 3: HttpService.RequestAsync
+        if not responseBody and HttpService and HttpService.RequestAsync then
+            local success, response = pcall(function()
+                return HttpService:RequestAsync({
+                    Url = API_URL,
+                    Method = "GET",
+                    Headers = headers
+                })
+            end)
+            if success and response and response.Body and type(response.Body) == "string" and #response.Body > 0 then
+                responseBody = response.Body
+            end
+        end
+        
+        -- Способ 4: game:HttpGet (последний вариант)
+        if not responseBody and game.HttpGet then
+            local success, body = pcall(function()
+                -- Пробуем с headers и без
+                if headers and next(headers) then
+                    return game:HttpGet(API_URL, true, headers)
+                else
+                    return game:HttpGet(API_URL, true)
+                end
+            end)
+            if success and body and type(body) == "string" and #body > 0 then
+                responseBody = body
+            end
+        end
+        
+        return responseBody
     end)
+    
     if ok and result and type(result) == "string" and #result > 0 then
         -- Проверяем, что это не HTML
-        if not result:find("<!DOCTYPE") and not result:find("<html") and not result:find("<body") then
-            return parseServerData(result)
+        if not result:find("<!DOCTYPE") and not result:find("<html") and not result:find("<body") and not result:find("<!doctype") then
+            local parsed = parseServerData(result)
+            return parsed
         end
     end
     return {}
@@ -516,7 +562,10 @@ end
 -- Обновление списка серверов
 local function updateServerList()
     local ok, err = pcall(function()
-        if not ServerListFrame then return end
+        if not ServerListFrame then 
+            task.wait(0.5)
+            return 
+        end
         
         -- Очистка старых карточек
         local children = ServerListFrame:GetChildren()
@@ -526,18 +575,26 @@ local function updateServerList()
             end
         end
         
-        -- Получение и фильтрация серверов
-        local allServers = fetchServerData()
-        if not allServers or #allServers == 0 then
-            -- Если серверов нет, обновляем canvas и выходим
-            task.wait(0.1)
+        -- Получение данных с API
+        local allServers = {}
+        pcall(function()
+            allServers = fetchServerData()
+        end)
+        
+        -- Если серверов нет, обновляем canvas и выходим
+        if not allServers or type(allServers) ~= "table" or #allServers == 0 then
+            task.wait(0.05)
             if updateServerListCanvas then
                 pcall(updateServerListCanvas)
             end
             return
         end
         
-        local filtered = filterServers(allServers)
+        -- Фильтрация серверов
+        local filtered = {}
+        pcall(function()
+            filtered = filterServers(allServers)
+        end)
         
         if #filtered > 0 then
             -- Сортировка по moneyPerSec (по убыванию)
@@ -549,13 +606,12 @@ local function updateServerList()
             
             -- Создание карточек
             for i, server in ipairs(filtered) do
-                if server and server.serverId then
+                if server and server.serverId and server.name then
                     pcall(function() 
                         local card = createServerCard(server, ServerListFrame, i)
-                        if not card then
-                            -- Если карточка не создалась, пропускаем
-                        end
                     end)
+                    -- Небольшая задержка между созданием карточек
+                    task.wait(0.01)
                 end
             end
         end
@@ -762,8 +818,15 @@ task.defer(function()
         task.delay(0.05, function()
             pcall(refreshUI)
         end)
-        -- Первое обновление списка с задержкой
-        task.delay(0.5, function()
+        -- Первое обновление списка - сразу и с задержкой
+        task.delay(0.2, function()
+            pcall(function()
+                if updateServerList then
+                    updateServerList()
+                end
+            end)
+        end)
+        task.delay(1, function()
             pcall(function()
                 if updateServerList then
                     updateServerList()
@@ -773,14 +836,15 @@ task.defer(function()
     end)
 end)
 
--- Периодическое обновление списка серверов
+-- Периодическое обновление списка серверов (работает всегда, даже когда окно закрыто)
 task.spawn(function()
+    task.wait(1) -- Первая задержка перед началом
     while true do
         pcall(function()
-            task.wait(UPDATE_INTERVAL)
-            if opened and updateServerList then
+            if updateServerList then
                 updateServerList()
             end
+            task.wait(UPDATE_INTERVAL)
         end)
     end
 end)
