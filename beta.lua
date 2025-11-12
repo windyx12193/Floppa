@@ -1,8 +1,6 @@
---[[ FLOPPA AUTO JOINER v6.4
-     • API: https://server-eta-two-29.vercel.app/api/jobs  (x-api-key)
-     • Старт с 0 серверов: первый срез помечается как seen, далее добавляются только новые
-     • Асинхронный пуллер + батч-апдейты UI (без микролагов); Refresh = мягкий триггер
-     • MIN M/S в МИЛЛИОНАХ; JOIN ретраи 10/сек; авто-реинжект; JSON-конфиг
+--[[ FLOPPA AUTO JOINER v6.4 — Patched
+     • Основные изменения: троттлинг перерисовки, условный ресорт, батч-апдейты,
+       адаптивный пуллинг, уменьшение твинов, безопасный CanvasSize, Top-N отображение
      • Хоткей GUI = T
 ]]
 
@@ -15,10 +13,14 @@ local SERVER_BASE       = "https://server-eta-two-29.vercel.app"
 local API_KEY           = "autojoiner_3b1e6b7f_ka97bj1x_8v4ln5ja"
 
 local TARGET_PLACE_ID   = 109983668079237
-local PULL_INTERVAL_SEC = 2.5         -- базовый интервал опроса
+local PULL_INTERVAL_SEC = 2.5         -- базовый интервал опроса (адаптивный ниже)
+local PULL_INTERVAL_MAX = 5.0         -- верхняя граница при тишине
+local PULL_INTERVAL_MIN = 1.8         -- нижняя граница при активных изменениях
 local ENTRY_TTL_SEC     = 180.0       -- авто-удаление старше 3 минут
 local FRESH_AGE_SEC     = 12.0        -- подсветка «новых»
 local DEBUG             = false
+local RENDER_LIMIT      = 80          -- Top-N рендер. Остальные скрыты (виртуализация лайтовая)
+
 ---------------------------------------------------
 
 local Players          = game:GetService("Players")
@@ -51,7 +53,9 @@ local function guiRoot()
     if okC then return core end
     return Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui") or nil
 end
-do
+
+-- убираем старый GUI
+ do
     local root = guiRoot()
     if root then local old = root:FindFirstChild("FloppaAutoJoinerGui"); if old then pcall(function() old:Destroy() end) end end
     local G=(getgenv and getgenv()) or _G; G.__FLOPPA_UI_ACTIVE=true
@@ -59,7 +63,7 @@ end
 
 -- ==== Persisted defaults ====
 local State = { AutoJoin=false, AutoInject=false, IgnoreEnabled=false, JoinRetry=50, MinMS=1, IgnoreNames={} }
-do
+ do
     local cfg=loadJSON(SETTINGS_PATH)
     if cfg then
         State.AutoJoin      = cfg.AutoJoin and true or false
@@ -94,7 +98,7 @@ local function mkToggle(p,txt,def)
         local pos=v and UDim2.new(1,-26,0.5,-12) or UDim2.new(0,2,0.5,-12)
         local col=v and COLORS.on or COLORS.off
         if inst then dot.Position=pos; dot.BackgroundColor3=col; sw.BackgroundColor3=v and Color3.fromRGB(55,58,74) or Color3.fromRGB(40,40,48)
-        else TweenService:Create(dot,TweenInfo.new(0.13,Enum.EasingStyle.Sine),{Position=pos}):Play(); TweenService:Create(dot,TweenInfo.new(0.12,Enum.EasingStyle.Sine),{BackgroundColor3=col}):Play(); TweenService:Create(sw,TweenInfo.new(0.12,Enum.EasingStyle.Sine),{BackgroundColor3=v and Color3.fromRGB(55,58,74) or Color3.fromRGB(40,40,48)}):Play() end
+        else dot.Position=pos; dot.BackgroundColor3=col; sw.BackgroundColor3=v and Color3.fromRGB(55,58,74) or Color3.fromRGB(40,40,48) end -- без твинов
         if state.Changed then task.defer(function() pcall(state.Changed,state.Value) end) end
     end
     apply(state.Value,true)
@@ -115,7 +119,7 @@ end
 
 -- ==== Blur ====
 local blur=Lighting:FindFirstChild("FloppaLightBlur") or Instance.new("BlurEffect"); blur.Name="FloppaLightBlur"; blur.Size=0; blur.Enabled=false; blur.Parent=Lighting
-local function setBlur(e) if e then blur.Enabled=true; TweenService:Create(blur,TweenInfo.new(0.15,Enum.EasingStyle.Sine),{Size=4}):Play() else TweenService:Create(blur,TweenInfo.new(0.15,Enum.EasingStyle.Sine),{Size=0}):Play(); task.delay(0.16,function() blur.Enabled=false end) end end
+local function setBlur(e) if e then blur.Enabled=true; blur.Size=4 else blur.Size=0; task.delay(0.02,function() blur.Enabled=false end) end end
 
 -- ==== Root GUI ====
 local root=guiRoot() or Players.LocalPlayer:WaitForChild("PlayerGui")
@@ -132,7 +136,7 @@ local leftPad=padding(left,0,0,0,10); local leftList=Instance.new("UIListLayout"
 local function updLeftCanvas() left.CanvasSize=UDim2.new(0,0,0,leftList.AbsoluteContentSize.Y+leftPad.PaddingBottom.Offset) end; leftList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updLeftCanvas)
 
 local right=Instance.new("Frame"); right.Size=UDim2.new(1,-320,1,-58); right.Position=UDim2.new(0,320,0,58); right.BackgroundColor3=COLORS.surface2; right.BackgroundTransparency=ALPHA.card; right.Parent=main; roundify(right,12); stroke(right); padding(right,12,12,12,12)
-local statsLbl=mkLabel(right,"shown: 0 • min: "..tostring(State.MinMS).."M/s",13,"medium",COLORS.textWeak); statsLbl.AnchorPoint=Vector2.new(1,0); statsLbl.Position=UDim2.new(1,-10,0,8); statsLbl.Size=UDim2.new(0,280,0,16); statsLbl.TextXAlignment=Enum.TextXAlignment.Right
+local statsLbl=mkLabel(right,"shown: 0 • min: 0M/s",13,"medium",COLORS.textWeak); statsLbl.AnchorPoint=Vector2.new(1,0); statsLbl.Position=UDim2.new(1,-10,0,8); statsLbl.Size=UDim2.new(0,280,0,16); statsLbl.TextXAlignment=Enum.TextXAlignment.Right
 
 mkHeader(left,"PRIORITY ACTIONS"); local _, autoJoin, _ = mkToggle(left,"AUTO JOIN",State.AutoJoin); local _,_,jrBox=mkStackInput(left,"JOIN RETRY","50",tostring(State.JoinRetry),true)
 mkHeader(left,"MONEY FILTERS");   local _,_,msBox=mkStackInput(left,"MIN M/S","1 (= $1M/s)",tostring(State.MinMS),true)
@@ -157,7 +161,7 @@ ignoreToggle.Changed=function(v) State.IgnoreEnabled=v; persist() end
 jrBox.FocusLost:Connect(function() State.JoinRetry=tonumber(jrBox.Text) or State.JoinRetry; persist() end)
 msBox.FocusLost:Connect(function() State.MinMS=tonumber(msBox.Text) or State.MinMS; persist() end)
 ignoreState.Changed=function(txt) State.IgnoreNames=parseIgnore(txt); persist() end
-persist() -- гарантированно создаём файл
+persist()
 
 -- ==== AutoInject (queue only) ====
 local function pickQueue() local q=nil; pcall(function() if syn and type(syn.queue_on_teleport)=="function" then q=syn.queue_on_teleport end end); if not q and type(queue_on_teleport)=="function" then q=queue_on_teleport end; if not q and type(queueteleport)=="function" then q=queueteleport end; if not q and type(fluxus)=="table" and type(fluxus.queue_on_teleport)=="function" then q=fluxus.queue_on_teleport end; return q end
@@ -174,7 +178,7 @@ local function apiGetJSON(limit)
     local req = getReqFn()
     local url = string.format("%s/api/jobs?limit=%d&_cb=%d", SERVER_BASE, limit or 200, math.random(10^6,10^7))
     if req then
-        local res = req({ Url = url, Method = "GET", Headers = { ["x-api-key"]=API_KEY, ["Accept"]="application/json" } })
+        local res = req({ Url = url, Method = "GET", Headers = { ["x-api-key"]=API_KEY, ["Accept"]="application/json" }, Timeout = 8 })
         if res and res.StatusCode == 200 and type(res.Body)=="string" then
             local ok, data = pcall(function() return HttpService:JSONDecode(res.Body) end)
             if ok then return true, data end
@@ -207,15 +211,15 @@ end
 
 -- ==== Entries, de-dupe & UI list ====
 local Entries, Order = {}, {}
-local SeenHashes = {}               -- то, что уже было на момент первого снимка + всё, что мы показали
-local firstSnapshotDone = false     -- пока false — первый fetch просто помечает SeenHashes
+local SeenHashes = {}               -- всё, что уже было (для инкрементальных добавлений)
+local firstSnapshotDone = false
 
 local function hashOf(item)
-    -- Хэш на связку jobId + moneyStr + players (на случай нескольких брейнротов на одном сервере)
     return string.format("%s|%s|%s", item.jobId or "", item.moneyStr or "", item.playersRaw or "")
 end
 
 local function playersFmt(p,m) return string.format("%d/%d", p or 0, m or 0) end
+
 local function ensureItem(jobId, data)
     local e=Entries[jobId]; if e and e.frame then return e.frame end
     local item=Instance.new("Frame"); item.Size=UDim2.new(1,-6,0,52); item.BackgroundColor3=COLORS.surface; item.BackgroundTransparency=ALPHA.panel; item.Parent=scroll; roundify(item,10); stroke(item,COLORS.purpleSoft,1,0.35); padding(item,12,6,12,6)
@@ -231,41 +235,89 @@ local function ensureItem(jobId, data)
         end
         task.delay(0.8,function() if joinBtn then joinBtn.Text="JOIN" end end)
     end)
+    -- только при первом появлении делаем мягкую подсветку
+    if (os.clock() - (data.firstSeen or os.clock())) <= FRESH_AGE_SEC then
+        item.BackgroundColor3 = Color3.fromRGB(22,28,26)
+    end
     Entries[jobId]={data=data, frame=item, firstSeen=os.clock(), lastSeen=os.clock(), refs={nameLbl=nameLbl, moneyLbl=moneyLbl, playersLbl=playersLbl}}
     return item
 end
+
+-- условные текстовые апдейты
+local function setTextIfDiff(lbl, s) if lbl and lbl.Text ~= s then lbl.Text = s end end
+
 local function updateItem(jobId, data)
     local e=Entries[jobId]
     if not e then ensureItem(jobId, data); table.insert(Order, jobId); e=Entries[jobId]
     else
+        -- апгрейд данных только если вырос mps
         if data.mps > (e.data.mps or 0) then e.data = data end
         e.lastSeen = os.clock()
     end
-    local r=e.refs; if r then r.nameLbl.Text=string.upper(e.data.name); r.moneyLbl.Text=string.upper(e.data.moneyStr or ""); r.playersLbl.Text=playersFmt(e.data.curPlayers,e.data.maxPlayers) end
+    local r=e.refs
+    if r then
+        setTextIfDiff(r.nameLbl, string.upper(e.data.name))
+        setTextIfDiff(r.moneyLbl, string.upper(e.data.moneyStr or ""))
+        setTextIfDiff(r.playersLbl, playersFmt(e.data.curPlayers,e.data.maxPlayers))
+    end
 end
+
 local function removeItem(jobId)
     local e=Entries[jobId]; if not e then return end
     if e.frame then pcall(function() e.frame:Destroy() end) end
     Entries[jobId]=nil; for i=#Order,1,-1 do if Order[i]==jobId then table.remove(Order,i) break end end
 end
+
+-- repaint троттлинг
+local NEED_REPAINT=false
+local lastPaint=0
+local REPAINT_COOLDOWN=0.33
+local lastCanvasY=0
+local function safeUpdateCanvas()
+    local newY = listLay.AbsoluteContentSize.Y + 10
+    if math.abs(newY - lastCanvasY) > 1 then
+        lastCanvasY = newY
+        scroll.CanvasSize = UDim2.new(0,0,0,newY)
+    end
+end
+local function schedulePaint() NEED_REPAINT=true end
 local function resortPaint()
-    table.sort(Order,function(a,b) local ea,eb=Entries[a],Entries[b]; if not ea or not eb then return (a or "")<(b or "") end; if ea.data.mps~=eb.data.mps then return ea.data.mps>eb.data.mps end; return ea.lastSeen>eb.lastSeen end)
+    -- сортировка по mps desc, затем по lastSeen desc
+    table.sort(Order,function(a,b)
+        local ea,eb=Entries[a],Entries[b]
+        if not ea or not eb then return (a or "")<(b or "") end
+        if ea.data.mps~=eb.data.mps then return ea.data.mps>eb.data.mps end
+        return ea.lastSeen>eb.lastSeen
+    end)
+
     local shown=0
     for idx,id in ipairs(Order) do
-        local e=Entries[id]; if e and e.frame then
-            e.frame.LayoutOrder=idx; local age=os.clock()-e.firstSeen
-            if age<=FRESH_AGE_SEC then e.frame.BackgroundColor3=Color3.fromRGB(22,28,26); e.frame.BackgroundTransparency=ALPHA.panel
-            else e.frame.BackgroundColor3=COLORS.surface; local st=math.clamp((os.clock()-e.lastSeen)/ENTRY_TTL_SEC,0,1); e.frame.BackgroundTransparency=ALPHA.panel+0.05*st end
-            shown+=1
+        local e=Entries[id]
+        if e and e.frame then
+            e.frame.LayoutOrder=idx
+            -- виртуализация: показываем только топ RENDER_LIMIT
+            local vis = idx <= RENDER_LIMIT
+            if e.frame.Visible ~= vis then e.frame.Visible = vis end
+            -- фон: без постоянных твинов
+            local age=os.clock()-e.firstSeen
+            if age<=FRESH_AGE_SEC then e.frame.BackgroundColor3=Color3.fromRGB(22,28,26) else e.frame.BackgroundColor3=COLORS.surface end
+            shown += vis and 1 or 0
         end
     end
     local minM=tonumber(msBox.Text) or State.MinMS or 0
     statsLbl.Text=string.format("shown: %d • min: %dM/s", shown, minM)
-    task.defer(function() scroll.CanvasSize=UDim2.new(0,0,0,listLay.AbsoluteContentSize.Y+10) end)
+    safeUpdateCanvas()
+end
+local function pumpPaint()
+    local now=os.clock()
+    if NEED_REPAINT and (now - lastPaint) >= REPAINT_COOLDOWN then
+        NEED_REPAINT=false
+        lastPaint = now
+        resortPaint()
+    end
 end
 
 -- ==== Pull loop (async, incremental) ====
-local multMap={K=1e3,M=1e6,B=1e9,T=1e12}
 local function pickBestByServer(items)
     local bestById={}
     for _,it in ipairs(items) do
@@ -290,7 +342,22 @@ end
 local wantImmediate = false
 refreshBtn.MouseButton1Click:Connect(function() wantImmediate = true end)
 
-task.spawn(function()
+-- адаптивный интервал
+local idleFetches=0
+local function adaptInterval(anyNew)
+    if anyNew then
+        idleFetches = 0
+        PULL_INTERVAL_SEC = math.max(PULL_INTERVAL_MIN, PULL_INTERVAL_SEC - 0.2)
+    else
+        idleFetches += 1
+        if idleFetches >= 2 then
+            PULL_INTERVAL_SEC = math.min(PULL_INTERVAL_MAX, PULL_INTERVAL_SEC + 0.3)
+        end
+    end
+end
+
+-- главный цикл с мягким шагом
+ task.spawn(function()
     local lastTick = 0
     while gui and gui.Parent do
         local now=os.clock()
@@ -298,38 +365,51 @@ task.spawn(function()
             wantImmediate=false
             lastTick = now
             local ok, data = apiGetJSON(250)
+            local changedForResort=false
+            local changedOnlyLabels=false
             if ok and type(data)=="table" and type(data.items)=="table" then
                 local best = pickBestByServer(data.items)
 
                 if not firstSnapshotDone then
-                    -- первый снимок: только запоминаем, ничего не рисуем
                     for _,d in pairs(best) do SeenHashes[hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})]=true end
                     firstSnapshotDone = true
+                    changedForResort = true
                 else
-                    -- инкрементально добавляем ТОЛЬКО новые хэши
-                    local anyChanged=false
+                    local anyNew=false
                     for _,d in pairs(best) do
                         local h = hashOf({jobId=d.jobId,moneyStr=d.moneyStr,playersRaw=d.playersRaw})
+                        local existing = Entries[d.jobId]
                         if not SeenHashes[h] then
                             SeenHashes[h]=true
                             updateItem(d.jobId, d)
-                            anyChanged=true
+                            changedForResort=true
+                            anyNew=true
                         else
-                            -- если запись уже «видели», просто обновим цифры онлайна/таймштамп
-                            if Entries[d.jobId] then
-                                Entries[d.jobId].data.curPlayers=d.curPlayers
-                                Entries[d.jobId].data.maxPlayers=d.maxPlayers
-                                Entries[d.jobId].lastSeen=os.clock()
+                            if existing then
+                                local oldCur, oldMax = existing.data.curPlayers, existing.data.maxPlayers
+                                if oldCur ~= d.curPlayers or oldMax ~= d.maxPlayers then
+                                    existing.data.curPlayers=d.curPlayers
+                                    existing.data.maxPlayers=d.maxPlayers
+                                    existing.lastSeen = os.clock()
+                                    -- только текст обновить
+                                    local r = existing.refs
+                                    if r then setTextIfDiff(r.playersLbl, playersFmt(d.curPlayers,d.maxPlayers)) end
+                                    changedOnlyLabels=true
+                                end
                             end
                         end
                     end
                     -- чистим протухшие
-                    for id,e in pairs(Entries) do if (os.clock()-e.lastSeen) > ENTRY_TTL_SEC then removeItem(id) end end
-                    if anyChanged then task.defer(resortPaint) else task.defer(resortPaint) end
+                    for id,e in pairs(Entries) do if (os.clock()-e.lastSeen) > ENTRY_TTL_SEC then removeItem(id); changedForResort=true end end
+                    adaptInterval(anyNew)
                 end
+            else
+                adaptInterval(false)
             end
+            if changedForResort or changedOnlyLabels then schedulePaint() end
         end
-        task.wait(0.05) -- мягкий цикл
+        pumpPaint()
+        task.wait(0.05)
     end
 end)
 
@@ -343,7 +423,11 @@ local opened=true
 local function setVisible(v,inst) opened=v; if v then setBlur(true) else setBlur(false) end
     local goal=v and UDim2.new(0.5,-490,0.5,-280) or UDim2.new(0.5,-490,1,30)
     if inst then main.Position=goal; main.Visible=v
-    else if v then main.Visible=true end; local t=TweenService:Create(main,TweenInfo.new(0.18,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Position=goal}); t:Play(); if not v then t.Completed:Wait(); main.Visible=false end end end
+    else if v then main.Visible=true end; main.Position = goal; if not v then main.Visible=false end end end
 UIS.InputBegan:Connect(function(input,gp) if not gp and input.KeyCode==FIXED_HOTKEY then setVisible(not opened,false) end end)
 makeDraggable(main, header)
-task.defer(function() updLeftCanvas(); setVisible(true,true) end)
+
+-- финализация
+ task.defer(function()
+    updLeftCanvas(); setVisible(true,true)
+end)
