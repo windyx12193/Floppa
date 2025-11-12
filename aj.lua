@@ -152,15 +152,53 @@ Players.LocalPlayer.OnTeleport:Connect(function(st) if autoInject.Value and st==
 -- ===== API (request) =====
 local function getReqFn() return (syn and syn.request) or http_request or request or (fluxus and fluxus.request) or nil end
 local function apiGetJSON(limit)
+    print("[FLOPPA DEBUG] Starting API request...")
     local req=getReqFn()
+    print("[FLOPPA DEBUG] Request function:", req and "found" or "not found")
+    
     local url=string.format("%s/api/jobs?limit=%d&_cb=%d",SERVER_BASE,limit or 100,math.random(1,1e7))
+    print("[FLOPPA DEBUG] URL:", url)
+    
     if req then
-        local res=req({Url=url,Method="GET",Headers={["x-api-key"]=API_KEY,["Accept"]="application/json"}})
-        if res and res.StatusCode==200 and type(res.Body)=="string" then local ok,d=pcall(function() return HttpService:JSONDecode(res.Body) end); if ok then return true,d end end
+        print("[FLOPPA DEBUG] Using custom request method")
+        local success, res = pcall(function()
+            return req({Url=url,Method="GET",Headers={["x-api-key"]=API_KEY,["Accept"]="application/json"}})
+        end)
+        
+        print("[FLOPPA DEBUG] Custom request success:", success)
+        if success and res then
+            print("[FLOPPA DEBUG] Status code:", res.StatusCode)
+            print("[FLOPPA DEBUG] Body length:", res.Body and #res.Body or "nil")
+        end
+        
+        if success and res and res.StatusCode==200 and type(res.Body)=="string" then 
+            local ok,d=pcall(function() return HttpService:JSONDecode(res.Body) end)
+            print("[FLOPPA DEBUG] JSON decode success:", ok)
+            if ok then return true,d end
+        end
         url=url.."&key="..API_KEY
     end
-    local ok,b=pcall(function() return game:HttpGet(url) end); if not ok or type(b)~="string" or #b==0 then return false end
-    local ok2,d=pcall(function()return HttpService:JSONDecode(b) end); if not ok2 then return false end
+    
+    print("[FLOPPA DEBUG] Falling back to HttpGet")
+    local ok,b=pcall(function() return game:HttpGet(url) end)
+    print("[FLOPPA DEBUG] HttpGet success:", ok)
+    if ok then
+        print("[FLOPPA DEBUG] Response length:", b and #b or "nil")
+    end
+    
+    if not ok or type(b)~="string" or #b==0 then 
+        print("[FLOPPA DEBUG] HttpGet failed or empty response")
+        return false 
+    end
+    
+    local ok2,d=pcall(function()return HttpService:JSONDecode(b) end)
+    print("[FLOPPA DEBUG] JSON decode success:", ok2)
+    if not ok2 then 
+        print("[FLOPPA DEBUG] JSON decode error")
+        return false 
+    end
+    
+    print("[FLOPPA DEBUG] API request successful!")
     return true,d
 end
 
