@@ -1,33 +1,35 @@
--- FLOPPA AUTO JOIN — WS push + safe fallback poll (anti-freeze, TOP)
+-- FLOPPA AUTO JOIN (pull-only, anti-freeze, newest at TOP)
 local PLACE_ID      = 109983668079237
-local WS_URL        = "wss://server-eta-two-29.vercel.app/api/ws"    -- <=== поменяй при необходимости
 local FEED_URL      = "https://server-eta-two-29.vercel.app/api/feed?limit=120"
-local SETTINGS_FILE = "floppa_push_or_pull.json"
+local SETTINGS_FILE = "floppa_pull_aj.json"
 
 local HttpService     = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 local Players         = game:GetService("Players")
 local LP              = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
--- ========== FS ==========
+-- ========= Files =========
 local function hasfs() return isfile and writefile and readfile end
 local function readf(p) local ok,d=pcall(function() return readfile(p) end); return ok and d or nil end
 local function writef(p,c) pcall(function() writefile(p,c) end) end
 
--- ========== Settings (START OFF) ==========
+-- ========= Settings (START OFF) =========
 local S = { started=false, minProfitM=1 }
-do local raw=hasfs() and isfile(SETTINGS_FILE) and readf(SETTINGS_FILE) or nil
-   if raw then local ok,t=pcall(function() return HttpService:JSONDecode(raw) end)
-      if ok and typeof(t)=="table" and tonumber(t.minProfitM) then S.minProfitM=tonumber(t.minProfitM) end
-   end
+do
+  local raw=hasfs() and isfile(SETTINGS_FILE) and readf(SETTINGS_FILE) or nil
+  if raw then
+    local ok,t=pcall(function() return HttpService:JSONDecode(raw) end)
+    if ok and typeof(t)=="table" and tonumber(t.minProfitM) then S.minProfitM=tonumber(t.minProfitM) end
+  end
 end
 local function persist()
-    if not hasfs() then return end
+  if hasfs() then
     writef(SETTINGS_FILE, HttpService:JSONEncode({ started=false, minProfitM=S.minProfitM }))
+  end
 end
 persist()
 
--- ========== helpers ==========
+-- ========= Utils / parse =========
 local MULT={K=1/1000,M=1,B=1000,T=1e6}
 local function trim(s) return (s:gsub("^%s+",""):gsub("%s+$","")) end
 local function clean(s) return (s:gsub("%*%*",""):gsub("\226\128\139","")) end
@@ -55,12 +57,25 @@ local function parse_line(line)
   line = clean(line or "")
   local id = uuid(line); if not id then return nil end
   local pM = profitM(line); local c,m = players(line); local nm = name_of(line)
-  if not (pM and c and m) then return {jobId=id} end
   return { jobId=id, profitM=pM, cur=c, max=m, name=nm, line=line }
 end
 
--- ========== UI ==========
-local gui=Instance.new("ScreenGui"); gui.Name="FLOPPA_PUSH_PULL_AJ"; gui.ResetOnSpawn=false
+-- ========= HTTP (no game:HttpGet => no freeze) =========
+local function http_get(u, timeoutSec)
+  local url = ("%s&t=%d"):format(u, math.floor(os.clock()*1000)%2147483647)
+  local to = math.max(1, math.floor(timeoutSec or 3))
+  local providers = {
+    function() if syn and syn.request then local ok,r=pcall(syn.request,{Url=url,Method="GET",Timeout=to}); if ok and r and r.Body then return r.Body end end end,
+    function() if http and http.request then local ok,r=pcall(http.request,{Url=url,Method="GET",Timeout=to}); if ok and r and r.Body then return r.Body end end end,
+    function() if request then local ok,r=pcall(request,{Url=url,Method="GET",Timeout=to}); if ok and r and r.Body then return r.Body end end end,
+    function() if fluxus and fluxus.request then local ok,r=pcall(fluxus.request,{Url=url,Method="GET",Timeout=to}); if ok and r and r.Body then return r.Body end end end,
+  }
+  for _,fn in ipairs(providers) do local body=fn(); if body then return body end end
+  return nil
+end
+
+-- ========= UI =========
+local gui=Instance.new("ScreenGui"); gui.Name="FLOPPA_AJ_PULL"; gui.ResetOnSpawn=false
 pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end; gui.Parent=(gethui and gethui()) or game:GetService("CoreGui") end)
 if not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
 
@@ -111,17 +126,18 @@ local statusLbl=Instance.new("TextLabel",card)
 statusLbl.Position=UDim2.new(0,12,1,-22); statusLbl.Size=UDim2.new(1,-24,0,16)
 statusLbl.BackgroundTransparency=1; statusLbl.Font=Enum.Font.Gotham; statusLbl.TextSize=12
 statusLbl.TextXAlignment=Enum.TextXAlignment.Left; statusLbl.TextColor3=C.text
-statusLbl.Text="stopped"; local function setStatus(t) statusLbl.Text=t end
+statusLbl.Text="stopped"
+local function setStatus(t) statusLbl.Text=t end
 
--- ========== auto-inject ==========
+-- ========= Auto-inject на следующий сервер =========
 do
   local loader=[[loadstring(game:HttpGet("https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/beta.lua"))()]]
   if queue_on_teleport then pcall(function() queue_on_teleport(loader) end)
   elseif syn and syn.queue_on_teleport then pcall(function() syn.queue_on_teleport(loader) end) end
 end
 
--- ========== Teleport (30/сек, лог только ретраи) ==========
-local RETRY_SLEEP = 0.033
+-- ========= Teleport (быстрые ретраи ~30/сек) =========
+local RETRY_SLEEP = 0.033  -- 30 раз/сек
 local STATE_STEP  = 0.02
 local STATE_WIN   = 0.60
 local function attempt_join(jobId)
@@ -147,135 +163,57 @@ local function attempt_join(jobId)
   return started
 end
 
--- ========== HTTP fallback (non-blocking only) ==========
-local function http_get(u, timeoutSec)
-  local url = ("%s&t=%d"):format(u, math.floor(os.clock()*1000)%2147483647)
-  local to = math.max(1, math.floor(timeoutSec or 3))
-  local prov = {
-    function() if syn and syn.request then local ok,r=pcall(syn.request,{Url=url,Method="GET",Timeout=to}); if ok and r and r.Body then return r.Body end end end,
-    function() if http and http.request then local ok,r=pcall(http.request,{Url=url,Method="GET",Timeout=to}); if ok and r and r.Body then return r.Body end end end,
-    function() if request then local ok,r=pcall(request,{Url=url,Method="GET",Timeout=to}); if ok and r and r.Body then return r.Body end end end,
-    function() if fluxus and fluxus.request then local ok,r=pcall(fluxus.request,{Url=url,Method="GET",Timeout=to}); if ok and r and r.Body then return r.Body end end end,
-  }
-  for _,fn in ipairs(prov) do local body=fn(); if body then return body end end
-  return nil  -- НИКАКОГО game:HttpGet -> никакого фриза
-end
+-- ========= Pull loop =========
+local pulling=false
+local function pull_once_and_try()
+  local body = http_get(FEED_URL, 3)
+  if not S.started then return end
+  if not body or #body==0 then setStatus("finding"); return end
 
-local function handle_feed_body(body)
-  if not body or #body==0 then return end
   local top = body:match("([^\r\n]+)")
+  if not top or #trim(top)==0 then setStatus("finding"); return end
+
   local it = parse_line(top)
-  if not it or not it.jobId then return end
-  if it.cur and it.max and it.cur>=it.max then return end
-  if it.profitM and it.profitM < S.minProfitM then return end
+  if not it or not it.jobId then setStatus("finding"); return end
+  if it.cur and it.max and it.cur>=it.max then setStatus("finding"); return end
+  if it.profitM and it.profitM < S.minProfitM then setStatus("finding"); return end
+
   setJoining(("joining: %s | %.1f M/s"):format(it.name or "?", it.profitM or 0))
   setStatus("joining…")
   local ok = attempt_join(it.jobId)
-  if ok then S.started=false; btn.Text="START"; btn.BackgroundColor3=C.btnOff; setStatus("stopped"); persist()
-  else setStatus("listening…") end
+  if ok then
+    S.started=false; btn.Text="START"; btn.BackgroundColor3=C.btnOff; setStatus("stopped"); persist()
+  else
+    setStatus("finding")
+  end
 end
 
--- ========== WS client (мульти-API, без nil:Connect) ==========
-local WS = {conn=nil, alive=false, mode="ws"} -- mode: "ws" or "pull"
-local function ws_connect()
-  if syn and syn.websocket and syn.websocket.connect then
-    local ok,ws = pcall(syn.websocket.connect, WS_URL); if ok and ws then return ws end
-  end
-  if WebSocket and WebSocket.connect then
-    local ok,ws = pcall(WebSocket.connect, WS_URL); if ok and ws then return ws end
-  end
-  if fluxus and fluxus.websocket and fluxus.websocket.connect then
-    local ok,ws = pcall(fluxus.websocket.connect, WS_URL); if ok and ws then return ws end
-  end
-  return nil
-end
-
-local function hook_event(ws, eventNames, cb)
-  for _,name in ipairs(eventNames) do
-    local ev = ws[name]
-    if typeof(ev)=="RBXScriptSignal" then
-      local ok,conn=pcall(function() return ev:Connect(cb) end)
-      if ok and conn then return conn end
-    elseif type(ev)=="function" then
-      -- некоторые API: ws.OnMessage(function(msg) ... end)
-      local ok = pcall(function() ev(cb) end)
-      if ok then return {Disconnect=function() end} end
-    elseif ev==nil and type(ws["Set"..name])=="function" then
-      -- редкие API: ws:SetOnMessage(cb)
-      local ok = pcall(function() ws["Set"..name](ws, cb) end)
-      if ok then return {Disconnect=function() end} end
-    end
-  end
-  -- Попробуем прямую установку свойства (ws.onmessage = cb)
-  for _,name in ipairs(eventNames) do
-    local lower = name:lower()
-    if ws[lower]==nil then
-      local ok = pcall(function() ws[lower] = cb end)
-      if ok then return {Disconnect=function() ws[lower]=nil end} end
-    end
-  end
-  return nil
-end
-
-local function ws_start()
-  if WS.conn then pcall(function() WS.conn:Close() end); WS.conn=nil end
-  local conn = ws_connect()
-  if not conn then
-    -- нет ws -> fallback pull
-    WS.mode="pull"; WS.alive=false; setStatus("polling…")
-    task.spawn(function()
-      while S.started and WS.mode=="pull" do
-        local body = http_get(FEED_URL, 3)
-        if S.started and body then handle_feed_body(body) end
-        task.wait(1.2)
-      end
-    end)
-    return
-  end
-
-  WS.conn = conn; WS.alive = true; WS.mode="ws"
-  setStatus(S.started and "listening…" or "stopped")
-
-  hook_event(conn, {"OnMessage","MessageReceived","Message","onmessage"}, function(msg)
-    if not S.started then return end
-    local okJ, obj = pcall(function() return HttpService:JSONDecode(msg) end)
-    local line = nil
-    if okJ and type(obj)=="table" and obj.type=="job" then
-      local okInner, inner = pcall(function() return HttpService:JSONDecode(obj.data or "") end)
-      if okInner and inner and inner.line then line = inner.line end
-    end
-    line = line or msg
-    handle_feed_body(line)
-  end)
-
-  hook_event(conn, {"OnClose","Closed","onclose"}, function()
-    WS.alive=false; WS.conn=nil
-    if S.started then setStatus("ws reconnect…"); task.wait(1.0); ws_start() else setStatus("stopped") end
-  end)
-
-  hook_event(conn, {"OnError","Error","onerror"}, function()
-    WS.alive=false; WS.conn=nil
-    if S.started then setStatus("ws error → reconnect"); task.wait(1.0); ws_start() else setStatus("stopped") end
-  end)
-
-  -- мягкий пинг
+local function start_pulling()
+  if pulling then return end
+  pulling=true
   task.spawn(function()
-    while S.started and WS.alive and WS.conn do
-      task.wait(20)
-      pcall(function() (WS.conn.Send or WS.conn.send or function() end)(WS.conn, "ping") end)
+    while S.started do
+      setStatus("finding")
+      pull_once_and_try()
+      local dt = 1.2
+      for _=1, math.floor(dt/0.1) do
+        if not S.started then break end
+        task.wait(0.1)
+      end
     end
+    pulling=false
   end)
 end
 
--- ========== start/stop ==========
+-- ========= Start/Stop =========
 local function setStarted(on)
   S.started = on and true or false
   btn.Text = S.started and "STOP" or "START"
   btn.BackgroundColor3 = S.started and C.btnOn or C.btnOff
-  setStatus(S.started and "connecting…" or "stopped")
+  setStatus(S.started and "finding" or "stopped")
   setJoining("joining: —")
   persist()
-  if S.started then ws_start() end
+  if S.started then start_pulling() end
 end
 setStarted(false)
 
