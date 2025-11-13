@@ -1,25 +1,24 @@
-
--- FLOPPA LAST-LINE AJ — bottom-only with lastSeen persistence
+-- FLOPPA — STRICT BOTTOM-ONLY (берём только самую нижнюю строку)
 local PLACE_ID      = 109983668079237
-local FEED_BASE     = "https://server-eta-two-29.vercel.app/api/feed?limit=160"
-local SETTINGS_FILE = "floppa_lastline_aj.json"
+local FEED_BASE     = "https://server-eta-two-29.vercel.app/api/feed?limit=200"
+local SETTINGS_FILE = "floppa_bottom_only.json"
 
 local HttpService     = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 local Players         = game:GetService("Players")
 local LocalPlayer     = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
--- ------------ log ------------
+-- --------- лог ---------
 local function ts() return os.date("!%H:%M:%S").."Z" end
 local function log(s)  print(("["..ts().."] "..tostring(s))) end
 local function warnf(s) warn(("["..ts().."] "..tostring(s))) end
 
--- ------------ file io ------------
+-- --------- FS ---------
 local function hasfs() return (isfile and writefile and readfile) and true or false end
 local function readf(p) local ok,d=pcall(function() return readfile(p) end); return ok and d or nil end
 local function writef(p,c) pcall(function() writefile(p,c) end) end
 
--- persist: minProfitM + lastSeenBottomId, started всегда OFF
+-- persist: minProfitM + lastSeenBottomId; START всегда OFF
 local Settings = { minProfitM = 1, started = false, lastSeenBottomId = "" }
 if hasfs() and isfile(SETTINGS_FILE) then
     local raw = readf(SETTINGS_FILE)
@@ -42,9 +41,9 @@ local function persist()
 end
 persist()
 
--- ------------ http ------------
+-- --------- HTTP (с кэш-бастером) ---------
 local function http_get(baseUrl)
-    local url = ("%s&t=%d"):format(baseUrl, math.floor((os.clock()%1e6)*1000)) -- cache buster
+    local url = ("%s&t=%d"):format(baseUrl, math.floor((os.clock()%1e6)*1000))
     local HEADERS = {
         ["accept"]        = "text/plain",
         ["cache-control"] = "no-cache, no-store, must-revalidate",
@@ -65,15 +64,15 @@ local function http_get(baseUrl)
     return nil
 end
 
--- ------------ parser ------------
+-- --------- парсер ---------
 local MULT = {K=1/1000, M=1, B=1000, T=1e6}
 local function trim(s) return (s:gsub("^%s+",""):gsub("%s+$","")) end
 local function clean(s) return (s:gsub("%*%*",""):gsub("\226\128\139","")) end
-local function parse_uuid_anywhere(line)
+local function parse_uuid(line)
     local pat = "([%x][%x][%x][%x][%x][%x][%x][%x]%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x)"
     return line:match(pat)
 end
-local function parse_profit_anywhere(line)
+local function parse_profit(line)
     local L = line:lower()
     for _,p in ipairs({
         "%$%s*([%d%.]+)%s*([kmbt]?)%s*/%s*s",
@@ -84,12 +83,11 @@ local function parse_profit_anywhere(line)
         local a,_,num,suf = L:find(p)
         if a then
             local n = tonumber(num or "0") or 0
-            local m = MULT[(suf or ""):upper()] or 1
-            return n * m
+            return n * (MULT[(suf or ""):upper()] or 1)
         end
     end
 end
-local function parse_players_anywhere(line)
+local function parse_players(line)
     local cur, max = line:match("(%d+)%s*/%s*(%d+)")
     if not cur then
         local c2,m2 = line:match("(%d+)%s*[%x\2044/\\]+%s*(%d+)")
@@ -98,24 +96,24 @@ local function parse_players_anywhere(line)
     end
     return tonumber(cur), tonumber(max)
 end
-local function parse_name_first_field(line)
+local function parse_name(line)
     local first = line:match("^([^|]+)|") or line
     return trim(clean(first))
 end
 local function parse_line(line)
     line = clean(line)
-    local jobId   = parse_uuid_anywhere(line)
-    local profitM = parse_profit_anywhere(line)
-    local cur,max = parse_players_anywhere(line)
-    local name    = parse_name_first_field(line)
+    local jobId   = parse_uuid(line)
+    local profitM = parse_profit(line)
+    local cur,max = parse_players(line)
+    local name    = parse_name(line)
     if jobId and profitM and cur and max then
         return { name=name, jobId=jobId, profitM=profitM, cur=cur, max=max }
     end
 end
 
--- ------------ UI ------------
+-- --------- UI (минимум) ---------
 local gui = Instance.new("ScreenGui")
-gui.Name = "FloppaLastLineAJ"; gui.ResetOnSpawn=false
+gui.Name = "FLOPPA_BOTTOM_ONLY"; gui.ResetOnSpawn=false
 pcall(function()
     if syn and syn.protect_gui then syn.protect_gui(gui) end
     gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
@@ -131,13 +129,13 @@ local title = Instance.new("TextLabel", frame)
 title.Position=UDim2.new(0,10,0,6); title.Size=UDim2.new(1,-20,0,22)
 title.BackgroundTransparency=1; title.Font=Enum.Font.GothamBold; title.TextSize=16
 title.TextColor3=Color3.fromRGB(230,233,240)
-title.Text="FLOPPA LAST-LINE AJ (BOTTOM newest)"
+title.Text="FLOPPA AJ — STRICT BOTTOM"
 title.TextXAlignment=Enum.TextXAlignment.Left
 
 local inputLabel = Instance.new("TextLabel", frame)
 inputLabel.Position=UDim2.new(0,10,0,34); inputLabel.Size=UDim2.new(0,150,0,22)
-inputLabel.BackgroundTransparency=1; inputLabel.TextColor3=Color3.fromRGB(180,186,196)
-inputLabel.Font=Enum.Font.Gotham; inputLabel.TextSize=14; inputLabel.TextXAlignment=Enum.TextXAlignment.Left
+inputLabel.BackgroundTransparency=1; inputLabel.Font=Enum.Font.Gotham; inputLabel.TextSize=14
+inputLabel.TextColor3=Color3.fromRGB(180,186,196); inputLabel.TextXAlignment=Enum.TextXAlignment.Left
 inputLabel.Text="Min profit (M/s):"
 
 local input = Instance.new("TextBox", frame)
@@ -157,7 +155,7 @@ statusLbl.BackgroundTransparency=1; statusLbl.Font=Enum.Font.Gotham; statusLbl.T
 statusLbl.TextColor3=Color3.fromRGB(150,155,165); statusLbl.TextWrapped=true
 statusLbl.TextXAlignment=Enum.TextXAlignment.Left; statusLbl.Text="idle (press START)"
 
--- вспом. кнопка: сброс lastSeen (на всякий)
+-- кнопка «забыть низ»
 local clr = Instance.new("TextButton", frame)
 clr.Size=UDim2.new(0,24,0,24); clr.Position=UDim2.new(1,-34,0,32)
 clr.BackgroundColor3=Color3.fromRGB(58,62,70); clr.Text="↻"; clr.TextColor3=Color3.fromRGB(230,230,230)
@@ -168,15 +166,15 @@ clr.Activated:Connect(function()
     log("lastSeenBottomId cleared by user")
 end)
 
--- ------------ state ------------
+-- --------- START/STOP/state ---------
 local joining=false
-local lastFeedSig=""
+local lastPreview=""
 
-local function reset_state(reason)
+local function reset_state(why)
     joining=false
-    lastFeedSig=""
-    statusLbl.Text="reset: "..(reason or "")
-    log("state reset: "..(reason or ""))
+    lastPreview=""
+    statusLbl.Text="reset: "..(why or "")
+    log("state reset: "..(why or ""))
 end
 
 local function setStarted(on)
@@ -192,10 +190,10 @@ setStarted(false)
 btn.Activated:Connect(function() setStarted(not Settings.started) end)
 input:GetPropertyChangedSignal("Text"):Connect(function()
     local v = tonumber(input.Text)
-    if v and v >= 0 then Settings.minProfitM=v; persist(); log("minProfitM -> "..v.." M/s") end
+    if v and v >= 0 then Settings.minProfitM = v; persist(); log("minProfitM -> "..v.." M/s") end
 end)
 
--- ------------ auto inject ------------
+-- --------- авто-инжект ---------
 do
     local loader = [[loadstring(game:HttpGet("https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/beta.lua"))()]]
     local ok=false
@@ -204,7 +202,7 @@ do
     persist(); log("queue_on_teleport set: "..tostring(ok))
 end
 
--- ------------ teleport ------------
+-- --------- телепорт ---------
 local function attempt_join(jobId)
     local lp = Players.LocalPlayer or Players.PlayerAdded:Wait()
     local tries, tpState = 0, nil
@@ -247,72 +245,76 @@ local function attempt_join(jobId)
     return started, tries
 end
 
--- ------------ helpers ------------
+-- --------- helpers ---------
 local function split_lines(body)
     local arr={}
-    for s in string.gmatch(body, "[^\r\n]+") do s=trim(s); if #s>0 then table.insert(arr,s) end end
+    for s in string.gmatch(body, "[^\r\n]+") do
+        s = trim(s)
+        if #s>0 then table.insert(arr, s) end
+    end
     return arr
 end
 
--- берём строго ПОСЛЕДНЮЮ (самую нижнюю) линию
-local function get_bottom(lines)
-    local line = lines[#lines]
-    if not line then return nil,nil,nil end
-    local it = parse_line(line)
-    local id = parse_uuid_anywhere(line)
-    return it, id, line
+-- *** СТРАНИЧНО ВАЖНО: берём строго ПОСЛЕДНЮЮ НЕПУСТУЮ строку ***
+local function get_strict_bottom(lines)
+    -- идём с конца, чтобы случайные пустые хвосты не мешали
+    for i = #lines, 1, -1 do
+        local line = lines[i]
+        if line and #trim(line) > 0 then
+            local id = parse_uuid(line)
+            local it = parse_line(line)
+            return it, id, line, i
+        end
+    end
+    return nil,nil,nil,nil
 end
 
--- ------------ main loop ------------
+-- --------- основной цикл ---------
 local function run_loop()
     if joining then return end
     joining=true
     while Settings.started do
-        statusLbl.Text = "fetch feed…"
+        statusLbl.Text="fetch bottom…"
         local body = http_get(FEED_BASE)
 
         if not body or #body==0 then
             statusLbl.Text="feed empty/error"; warnf("feed empty/error"); task.wait(1.0)
         else
             local lines = split_lines(body)
-            local it, bottomId, preview = get_bottom(lines)
-            local sig = tostring(#lines).."|"..(preview or "")
-            if sig ~= lastFeedSig then
-                lastFeedSig = sig
-                log(("lines=%d | bottom='%s'"):format(#lines, (preview or "<empty>"):sub(1,120)))
-            end
+            local it, bottomId, preview, idx = get_strict_bottom(lines)
+
+            -- лог короткого превью (верх/низ и что выбрали)
+            local top = lines[1] or "<empty>"
+            local bot = lines[#lines] or "<empty>"
+            local previewSig = ("top='%s' | bot='%s' | pick[%d]='%s'")
+                :format(top:sub(1,60), bot:sub(1,60), idx or -1, (preview or "<nil>"):sub(1,60))
+            if previewSig ~= lastPreview then lastPreview = previewSig; log(previewSig) end
 
             if not bottomId then
-                statusLbl.Text="bottom parse fail"; task.wait(0.6)
-
+                statusLbl.Text="bottom parse fail"; task.wait(0.5)
             elseif bottomId == Settings.lastSeenBottomId then
-                -- это тот же самый низ, который мы уже видели — не трогаем (не лезем к Los Tortus)
-                statusLbl.Text="no new bottom ("..string.sub(bottomId,1,8)..")"
-                task.wait(0.5)
-
+                statusLbl.Text="no NEW bottom ("..string.sub(bottomId,1,8)..")"
+                task.wait(0.45)
             else
-                -- новый низ — запоминаем сразу, даже если он не подходит (чтоб не повторять)
+                -- новый низ: запоминаем СРАЗУ, чтоб не возвращаться к старому
                 log("bottom changed: "..tostring(Settings.lastSeenBottomId).." -> "..bottomId)
                 Settings.lastSeenBottomId = bottomId
                 persist()
 
-                if not it or not it.jobId then
-                    statusLbl.Text="new bottom parse fail"; task.wait(0.6)
-
+                if not it then
+                    statusLbl.Text="new bottom unparsable"; task.wait(0.5)
                 elseif it.cur >= it.max then
-                    statusLbl.Text=("bottom full %d/%d, wait next…"):format(it.cur,it.max)
-                    log(("skip: full %d/%d | %s"):format(it.cur,it.max,it.jobId))
-                    task.wait(0.6)
-
+                    statusLbl.Text=("bottom full %d/%d — wait next…"):format(it.cur,it.max)
+                    log(("skip (full): %s"):format(preview or "?"))
+                    task.wait(0.5)
                 elseif it.profitM < Settings.minProfitM then
-                    statusLbl.Text=("bottom < %.2f M/s, wait next…"):format(Settings.minProfitM)
-                    log(("skip: profit %.2fM/s < %.2f"):format(it.profitM, Settings.minProfitM))
-                    task.wait(0.6)
-
+                    statusLbl.Text=("bottom < %.2f M/s — wait next…"):format(Settings.minProfitM)
+                    log(("skip (profit %.2f < %.2f): %s"):format(it.profitM, Settings.minProfitM, preview or "?"))
+                    task.wait(0.5)
                 else
-                    local msg = ("join NEW bottom %s | %.2fM/s | %d/%d | %s"):format(
-                        it.name or "?", it.profitM or 0, it.cur or 0, it.max or 0, it.jobId)
-                    statusLbl.Text=msg; log(msg)
+                    local msg = ("JOIN bottom %s | %.2fM/s | %d/%d | %s")
+                        :format(it.name or "?", it.profitM or 0, it.cur or 0, it.max or 0, it.jobId)
+                    statusLbl.Text = msg; log(msg)
 
                     local ok, tries = attempt_join(it.jobId)
                     if ok then
@@ -322,9 +324,8 @@ local function run_loop()
                         joining=false
                         return
                     else
-                        log("join failed after "..tries.." tries — waiting NEXT bottom (no repeats)")
-                        -- ничего не делаем: lastSeen уже обновили, будем ждать следующего id
-                        task.wait(0.7)
+                        log("join failed after "..tries.." tries — waiting NEXT bottom")
+                        task.wait(0.6)
                     end
                 end
             end
@@ -336,7 +337,7 @@ end
 -- UI loop
 task.spawn(function()
     log("script loaded; started=OFF; place="..tostring(game.PlaceId).."; PLACE_ID="..tostring(PLACE_ID).."; lastSeenBottomId="..(Settings.lastSeenBottomId or ""))
-    while task.wait(0.4) do
+    while task.wait(0.35) do
         if Settings.started and not joining then
             run_loop()
         else
