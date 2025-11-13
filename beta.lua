@@ -182,7 +182,7 @@ local function attempt_join(jobId)
 end
 
 -- --------- pull loop ----------
-local POLL_PERIOD = 0.3  -- увеличь до 2.5–3.0, если хочешь вообще «идеально гладко»
+local POLL_PERIOD = 0.1  -- увеличь до 2.5–3.0, если хочешь вообще «идеально гладко»
 local pulling=false
 local function fetch_top_line()
   local sc,body = http_get(FEED_URL, 3)
