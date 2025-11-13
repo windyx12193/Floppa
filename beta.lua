@@ -1,6 +1,6 @@
--- FLOPPA AJ (TOP, anti-freeze) — fast retries, minimal UI work
+-- FLOPPA AJ (TOP, anti-freeze v2) — async net worker + backoff, fast teleport retries
 local PLACE_ID      = 109983668079237
-local FEED_URL      = "https://server-eta-two-29.vercel.app/api/feed?limit=200"
+local FEED_URL      = "https://server-eta-two-29.vercel.app/api/feed?limit=120" -- меньше строк => меньше лагов
 local SETTINGS_FILE = "floppa_top_prefs.json"
 
 local HttpService     = game:GetService("HttpService")
@@ -33,24 +33,66 @@ local function persist()
 end
 persist()
 
--- ========== HTTP ==========
-local function http_get(u)
+-- ========== HTTP (async worker + timeout + single-flight) ==========
+local function http_get(u, timeoutSec)
     local url = ("%s&t=%d"):format(u, math.floor(os.clock()*1000)%2147483647)
+    local to = math.max(1, math.floor(timeoutSec or 3))
     local providers = {
-        function(U) if syn and syn.request then return syn.request({Url=U,Method="GET"}) end end,
-        function(U) if http and http.request then return http.request({Url=U,Method="GET"}) end end,
-        function(U) if request then return request({Url=U,Method="GET"}) end end,
-        function(U) if fluxus and fluxus.request then return fluxus.request({Url=U,Method="GET"}) end end,
+        function(U) if syn and syn.request then return syn.request({Url=U,Method="GET",Timeout=to}) end end,
+        function(U) if http and http.request then return http.request({Url=U,Method="GET",Timeout=to}) end end,
+        function(U) if request then return request({Url=U,Method="GET",Timeout=to}) end end,
+        function(U) if fluxus and fluxus.request then return fluxus.request({Url=U,Method="GET",Timeout=to}) end end,
     }
     for _,fn in ipairs(providers) do
         local ok,res=pcall(fn,url); if ok and res and res.Body then return res.Body end
     end
-    local ok2,body=pcall(function() return game:HttpGet(url) end)
+    local ok2,body=pcall(function() return game:HttpGet(url) end) -- может блокировать дольше — используется как запасной
     if ok2 then return body end
     return nil
 end
 
--- ========== parsing (TOP only, без аллокаций) ==========
+-- общий буфер от сетевого воркера
+local NET = {
+    busy=false,          -- идёт запрос
+    body=nil,            -- последняя удачная выдача
+    seq=0,               -- monotonically increasing
+    lastPoll=0.0,        -- последний запуск запроса
+    backoff=0.8,         -- интервал опроса (экспон. бэк-офф до 5.0)
+}
+
+local MAX_BACKOFF = 5.0
+local MIN_BACKOFF = 0.8
+
+local function net_poll_once()
+    if NET.busy then return end
+    NET.busy = true
+    NET.lastPoll = os.clock()
+    task.spawn(function()
+        local body = http_get(FEED_URL, 3) -- жёсткий таймаут 3с
+        if body and #body>0 then
+            NET.body = body
+            NET.seq  = NET.seq + 1
+            NET.backoff = MIN_BACKOFF -- успех => сброс бэк-оффа
+        else
+            -- ошибка/пусто => увеличим паузу опроса (но не выше MAX)
+            NET.backoff = math.min(MAX_BACKOFF, (NET.backoff * 1.7))
+        end
+        NET.busy = false
+    end)
+end
+
+-- планировщик опроса сети (не блокирует геймтред)
+task.spawn(function()
+    while true do
+        -- если давно не опрашивали и ничего не висит — один запрос
+        if not NET.busy and (os.clock() - NET.lastPoll) >= NET.backoff then
+            net_poll_once()
+        end
+        task.wait(0.15) -- лёгкий тик, без нагрузки
+    end
+end)
+
+-- ========== parsing (TOP only) ==========
 local MULT={K=1/1000,M=1,B=1000,T=1e6}
 local function trim(s) return (s:gsub("^%s+",""):gsub("%s+$","")) end
 local function clean(s) return (s:gsub("%*%*",""):gsub("\226\128\139","")) end
@@ -90,7 +132,7 @@ end
 
 -- ========== UI (минимум перерисовок) ==========
 local gui=Instance.new("ScreenGui")
-gui.Name="FLOPPA_AJ_TOP_AF"
+gui.Name="FLOPPA_AJ_TOP_AF2"
 gui.ResetOnSpawn=false
 pcall(function()
     if syn and syn.protect_gui then syn.protect_gui(gui) end
@@ -127,10 +169,8 @@ local joiningLbl=Instance.new("TextLabel",card)
 joiningLbl.Position=UDim2.new(0,12,0,24); joiningLbl.Size=UDim2.new(1,-24,0,14)
 joiningLbl.BackgroundTransparency=1; joiningLbl.Font=Enum.Font.Gotham; joiningLbl.TextSize=12
 joiningLbl.TextXAlignment=Enum.TextXAlignment.Left; joiningLbl.TextColor3=Color3.fromRGB(205,210,220)
-joiningLbl.Text="joining: —"; local joiningPrev = joiningLbl.Text
-local function setJoining(t)
-    if t ~= joiningPrev then joiningPrev=t; joiningLbl.Text=t end
-end
+joiningLbl.Text="joining: —"; local joiningPrev=joiningLbl.Text
+local function setJoining(t) if t~=joiningPrev then joiningPrev=t; joiningLbl.Text=t end end
 
 local lab=Instance.new("TextLabel",card)
 lab.Position=UDim2.new(0,12,0,40); lab.Size=UDim2.new(0,140,0,18)
@@ -156,9 +196,7 @@ statusLbl.Position=UDim2.new(0,12,1,-22); statusLbl.Size=UDim2.new(1,-24,0,16)
 statusLbl.BackgroundTransparency=1; statusLbl.Font=Enum.Font.Gotham; statusLbl.TextSize=12
 statusLbl.TextXAlignment=Enum.TextXAlignment.Left; statusLbl.TextColor3=C.text
 statusLbl.Text="stopped"; local statusPrev=statusLbl.Text
-local function setStatus(t)
-    if t~=statusPrev then statusPrev=t; statusLbl.Text=t end
-end
+local function setStatus(t) if t~=statusPrev then statusPrev=t; statusLbl.Text=t end end
 
 -- ========== auto-inject ==========
 do
@@ -167,9 +205,8 @@ do
   elseif syn and syn.queue_on_teleport then pcall(function() syn.queue_on_teleport(loader) end) end
 end
 
--- ========== teleport (fast but light) ==========
--- 30/с попытки, но лог в консоль не чаще, чем раз в 0.5 c
-local RETRY_SLEEP = 0.033
+-- ========== teleport (быстро, но без спама логов) ==========
+local RETRY_SLEEP = 0.033   -- ~30/сек
 local STATE_STEP  = 0.02
 local STATE_WIN   = 0.60
 local function attempt_join(jobId)
@@ -219,46 +256,51 @@ input:GetPropertyChangedSignal("Text"):Connect(function()
     local v=tonumber(input.Text); if v and v>=0 then S.minProfitM=v; persist() end
 end)
 
--- ========== loop (TOP only, с анти-фриз тактом) ==========
-local function run_loop()
-    if busy or not S.started then return end
-    busy=true
-    task.spawn(function()
-        while S.started do
-            local body = http_get(FEED_URL)
-            if not body or #body==0 then
-                setStatus("fetch error / empty"); task.wait(0.65)
-            else
-                local it, id = parse_top(body) -- TOP
-                if not id then
-                    setStatus("parse error"); task.wait(0.5)
-                elseif id == S.lastTopId then
-                    setStatus("finding"); task.wait(0.55)
-                else
-                    S.lastTopId = id; persist()
-                    if it and it.cur < it.max and it.profitM >= S.minProfitM then
-                        setJoining(("joining: %s | %.1f M/s"):format(it.name or "?", it.profitM or 0))
-                        setStatus("joining…")
-                        local ok = attempt_join(it.jobId)
-                        if ok then
-                            setStarted(false) -- автоподгрузится на новом сервере
-                            busy=false
-                            return
-                        else
-                            setStatus("finding")
-                        end
-                    else
-                        setStatus("finding"); task.wait(0.55)
-                    end
-                end
-            end
+-- ========== main logic (читает только буфер NET, сеть не трогает) ==========
+local lastSeq = -1
+local function handle_feed_if_new()
+    if NET.seq == lastSeq then return end  -- нет новых данных
+    lastSeq = NET.seq
+    local body = NET.body
+    if not body or #body==0 then return end
+
+    local it, id = (function() -- parse_top
+        local line = first_line(body)
+        if not line then return nil,nil end
+        line = clean(line)
+        local jid = uuid(line); if not jid then return nil,nil end
+        local pM  = profitM(line); local c,m = players(line); local nm = name_of(line)
+        if not (pM and c and m) then return nil,jid end
+        return {jobId=jid, profitM=pM, cur=c, max=m, name=nm, line=line}, jid
+    end)()
+
+    if not id then
+        setStatus("parse error"); return
+    end
+    if id == S.lastTopId then
+        setStatus("finding"); return
+    end
+
+    -- новый «топ»
+    S.lastTopId = id; persist()
+    if it and it.cur < it.max and it.profitM >= S.minProfitM then
+        setJoining(("joining: %s | %.1f M/s"):format(it.name or "?", it.profitM or 0))
+        setStatus("joining…")
+        local ok = attempt_join(it.jobId)
+        if ok then
+            setStarted(false) -- автозагрузка на новом сервере
+        else
+            setStatus("finding")
         end
-        busy=false
-    end)
+    else
+        setStatus("finding")
+    end
 end
 
 task.spawn(function()
-    while task.wait(0.33) do
-        if S.started and not busy then run_loop() end
+    while task.wait(0.20) do
+        if S.started then
+            handle_feed_if_new() -- только читает буфер, никогда не делает HTTP
+        end
     end
 end)
