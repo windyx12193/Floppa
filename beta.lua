@@ -1,7 +1,7 @@
--- FLOPPA AUTO JOIN (pull-only, anti-freeze, newest at TOP)
+-- FLOPPA AUTO JOIN (pull-only, anti-freeze, NEWEST AT TOP, wait-for-new)
 local PLACE_ID      = 109983668079237
 local FEED_URL      = "https://server-eta-two-29.vercel.app/api/feed?limit=120"
-local SETTINGS_FILE = "floppa_pull_aj.json"
+local SETTINGS_FILE = "floppa_pull_wait_new.json"
 
 local HttpService     = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
@@ -13,18 +13,25 @@ local function hasfs() return isfile and writefile and readfile end
 local function readf(p) local ok,d=pcall(function() return readfile(p) end); return ok and d or nil end
 local function writef(p,c) pcall(function() writefile(p,c) end) end
 
--- ========= Settings (START OFF) =========
-local S = { started=false, minProfitM=1 }
+-- ========= Settings =========
+local S = { started=false, minProfitM=1, lastTopId="" } -- lastTopId = запомненный верхний ID
 do
   local raw=hasfs() and isfile(SETTINGS_FILE) and readf(SETTINGS_FILE) or nil
   if raw then
     local ok,t=pcall(function() return HttpService:JSONDecode(raw) end)
-    if ok and typeof(t)=="table" and tonumber(t.minProfitM) then S.minProfitM=tonumber(t.minProfitM) end
+    if ok and typeof(t)=="table" then
+      if tonumber(t.minProfitM) then S.minProfitM=tonumber(t.minProfitM) end
+      if type(t.lastTopId)=="string" then S.lastTopId=t.lastTopId end
+    end
   end
 end
 local function persist()
   if hasfs() then
-    writef(SETTINGS_FILE, HttpService:JSONEncode({ started=false, minProfitM=S.minProfitM }))
+    writef(SETTINGS_FILE, HttpService:JSONEncode({
+      started=false,                 -- всегда OFF при рестарте
+      minProfitM=S.minProfitM,
+      lastTopId=S.lastTopId or ""
+    }))
   end
 end
 persist()
@@ -75,7 +82,7 @@ local function http_get(u, timeoutSec)
 end
 
 -- ========= UI =========
-local gui=Instance.new("ScreenGui"); gui.Name="FLOPPA_AJ_PULL"; gui.ResetOnSpawn=false
+local gui=Instance.new("ScreenGui"); gui.Name="FLOPPA_AJ_WAITNEW"; gui.ResetOnSpawn=false
 pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end; gui.Parent=(gethui and gethui()) or game:GetService("CoreGui") end)
 if not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
 
@@ -129,7 +136,7 @@ statusLbl.TextXAlignment=Enum.TextXAlignment.Left; statusLbl.TextColor3=C.text
 statusLbl.Text="stopped"
 local function setStatus(t) statusLbl.Text=t end
 
--- ========= Auto-inject на следующий сервер =========
+-- ========= Auto-inject =========
 do
   local loader=[[loadstring(game:HttpGet("https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/beta.lua"))()]]
   if queue_on_teleport then pcall(function() queue_on_teleport(loader) end)
@@ -137,7 +144,7 @@ do
 end
 
 -- ========= Teleport (быстрые ретраи ~30/сек) =========
-local RETRY_SLEEP = 0.033  -- 30 раз/сек
+local RETRY_SLEEP = 0.033
 local STATE_STEP  = 0.02
 local STATE_WIN   = 0.60
 local function attempt_join(jobId)
@@ -163,28 +170,52 @@ local function attempt_join(jobId)
   return started
 end
 
+-- ========= Pull helpers =========
+local function first_line(body)
+  return body and body:match("([^\r\n]+)") or nil
+end
+
+local function fetch_top_line()
+  local body = http_get(FEED_URL, 3)
+  if not body or #body==0 then return nil end
+  local top = first_line(body)
+  if not top or #trim(top)==0 then return nil end
+  return parse_line(top) -- {jobId, profitM, cur, max, name}
+end
+
 -- ========= Pull loop =========
 local pulling=false
-local function pull_once_and_try()
-  local body = http_get(FEED_URL, 3)
-  if not S.started then return end
-  if not body or #body==0 then setStatus("finding"); return end
 
-  local top = body:match("([^\r\n]+)")
-  if not top or #trim(top)==0 then setStatus("finding"); return end
+-- базовая инициализация lastTopId при старте (чтобы ждать новую строку)
+local function baseline_snapshot()
+  local it = fetch_top_line()
+  if it and it.jobId then
+    S.lastTopId = it.jobId
+    persist()
+  end
+end
 
-  local it = parse_line(top)
-  if not it or not it.jobId then setStatus("finding"); return end
-  if it.cur and it.max and it.cur>=it.max then setStatus("finding"); return end
-  if it.profitM and it.profitM < S.minProfitM then setStatus("finding"); return end
+local function try_new_top()
+  local it = fetch_top_line()
+  if not it or not it.jobId then setStatus("waiting new…"); return end
 
+  -- ждём именно новую верхнюю строку
+  if it.jobId == (S.lastTopId or "") then setStatus("waiting new…"); return end
+
+  -- фильтры
+  if it.cur and it.max and it.cur>=it.max then setStatus("waiting new…"); S.lastTopId = it.jobId; persist(); return end
+  if it.profitM and it.profitM < S.minProfitM then setStatus("waiting new…"); S.lastTopId = it.jobId; persist(); return end
+
+  -- пытаемся зайти
   setJoining(("joining: %s | %.1f M/s"):format(it.name or "?", it.profitM or 0))
   setStatus("joining…")
   local ok = attempt_join(it.jobId)
+  -- запоминаем как последний увиденный top в любом случае, чтобы дальше ждать следующий
+  S.lastTopId = it.jobId; persist()
   if ok then
-    S.started=false; btn.Text="START"; btn.BackgroundColor3=C.btnOff; setStatus("stopped"); persist()
+    S.started=false; btn.Text="START"; btn.BackgroundColor3=C.btnOff; setStatus("teleporting…")
   else
-    setStatus("finding")
+    setStatus("waiting new…")
   end
 end
 
@@ -193,8 +224,7 @@ local function start_pulling()
   pulling=true
   task.spawn(function()
     while S.started do
-      setStatus("finding")
-      pull_once_and_try()
+      try_new_top()
       local dt = 1.2
       for _=1, math.floor(dt/0.1) do
         if not S.started then break end
@@ -210,10 +240,15 @@ local function setStarted(on)
   S.started = on and true or false
   btn.Text = S.started and "STOP" or "START"
   btn.BackgroundColor3 = S.started and C.btnOn or C.btnOff
-  setStatus(S.started and "finding" or "stopped")
   setJoining("joining: —")
+  if S.started then
+    setStatus("waiting new…")
+    baseline_snapshot()     -- <== важное: запоминаем текущий TOP и ждём следующий
+    start_pulling()
+  else
+    setStatus("stopped")
+  end
   persist()
-  if S.started then start_pulling() end
 end
 setStarted(false)
 
