@@ -1,4 +1,4 @@
--- FLOPPA LAST-LINE AJ — FEED (newest = BOTTOM, remember last)
+-- FLOPPA LAST-LINE AJ — FEED (BOTTOM newest, mark after success)
 local PLACE_ID      = 109983668079237
 local FEED_URL      = "https://server-eta-two-29.vercel.app/api/feed?limit=120"
 local SETTINGS_FILE = "floppa_lastline_aj.json"
@@ -14,12 +14,12 @@ local function ts() return os.date("!%H:%M:%S").."Z" end
 local function log(s)  print(("["..ts().."] "..tostring(s))) end
 local function warnf(s) warn(("["..ts().."] "..tostring(s))) end
 
--- FS helpers
+-- FS
 local function hasfs() return (isfile and writefile and readfile) and true or false end
 local function readf(p) local ok,d=pcall(function() return readfile(p) end); return ok and d or nil end
 local function writef(p,c) pcall(function() writefile(p,c) end) end
 
--- Settings (persisted): started is always false on load
+-- Settings: keep lastSeenId, start always OFF
 local Settings = { minProfitM = 1, started = false, lastSeenId = nil }
 if hasfs() and isfile(SETTINGS_FILE) then
     local raw = readf(SETTINGS_FILE)
@@ -35,7 +35,7 @@ local function persist()
     if hasfs() then
         writef(SETTINGS_FILE, HttpService:JSONEncode({
             minProfitM = Settings.minProfitM,
-            started    = false,             -- всегда OFF при сохранении
+            started    = false,
             lastSeenId = Settings.lastSeenId
         }))
     end
@@ -74,7 +74,8 @@ local function parse_profit_anywhere(line)
         "%$%s*([%d%.]+)%s*([kmbt]?)%s*/%s*s",
         "%%?%$%s*([%d%.]+)%s*([kmbt]?)%s*&%#x2f;?%s*s",
         "%$%s*([%d%.]+)%s*([kmbt]?)%s*\\%s*s",
-        "%$%s*([%d%.]+)%s*([kmbt]?)%s+s",
+        "%$%s*([%d%.]+)%s*([%kmbt]?)%s+s",
+        "%$%s*([%d%.]+)%s*([kmbt]?)%s*s",
     }
     for _,p in ipairs(pats) do
         local a,_,num,suf = L:find(p)
@@ -122,13 +123,13 @@ end)
 if not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
 local frame = Instance.new("Frame", gui)
-frame.Size = UDim2.fromOffset(320, 160); frame.Position = UDim2.new(0,20,0,100)
+frame.Size = UDim2.fromOffset(340, 168); frame.Position = UDim2.new(0,20,0,100)
 frame.BackgroundColor3 = Color3.fromRGB(28,31,36); frame.BorderSizePixel = 0
 frame.Active = true; frame.Draggable = true
 
 local title = Instance.new("TextLabel", frame)
 title.Size = UDim2.new(1,-10,0,24); title.Position = UDim2.new(0,10,0,6)
-title.BackgroundTransparency = 1; title.Text = "FLOPPA LAST-LINE AJ (BOTTOM=newest)"
+title.BackgroundTransparency = 1; title.Text = "FLOPPA LAST-LINE AJ (BOTTOM newest)"
 title.Font = Enum.Font.GothamBold; title.TextSize = 16; title.TextColor3 = Color3.fromRGB(230,233,240)
 title.TextXAlignment = Enum.TextXAlignment.Left
 
@@ -150,11 +151,10 @@ btn.BackgroundColor3 = Color3.fromRGB(46,204,113); btn.Text = "START"
 btn.TextColor3 = Color3.fromRGB(10,10,10); btn.Font = Enum.Font.GothamBold; btn.TextSize = 16
 
 local statusLbl = Instance.new("TextLabel", frame)
-statusLbl.Size = UDim2.new(1,-20,0,40); statusLbl.Position = UDim2.new(0,10,0,112)
+statusLbl.Size = UDim2.new(1,-20,0,44); statusLbl.Position = UDim2.new(0,10,0,112)
 statusLbl.BackgroundTransparency = 1; statusLbl.Text = "idle (press START)"
 statusLbl.TextColor3 = Color3.fromRGB(150,155,165); statusLbl.Font = Enum.Font.Gotham; statusLbl.TextSize = 13
-statusLbl.TextXAlignment = Enum.TextXAlignment.Left
-statusLbl.TextWrapped = true
+statusLbl.TextXAlignment = Enum.TextXAlignment.Left; statusLbl.TextWrapped = true
 
 local function setStarted(on)
     Settings.started = on and true or false
@@ -197,7 +197,7 @@ local function attempt_join(jobId)
     local onTp = LocalPlayer.OnTeleport:Connect(function(state) tpState = state end)
     local started=false
     while tries < 65 and not started do
-        tries = tries + 1
+        tries += 1
         local ok,err = pcall(function()
             TeleportService:TeleportToPlaceInstance(PLACE_ID, jobId, LocalPlayer)
         end)
@@ -207,7 +207,7 @@ local function attempt_join(jobId)
             if tpState == Enum.TeleportState.Started or tpState == Enum.TeleportState.InProgress then
                 started=true; break
             end
-            task.wait(0.02); t = t + 0.02
+            task.wait(0.02); t += 0.02
         end
         if not started then task.wait(0.1) end -- 10/сек
     end
@@ -215,7 +215,7 @@ local function attempt_join(jobId)
     return started, tries
 end
 
--- Split feed into lines (order preserved). Bottom = newest.
+-- Helpers
 local function split_lines(body)
     local arr = {}
     for s in string.gmatch(body, "[^\r\n]+") do
@@ -225,20 +225,26 @@ local function split_lines(body)
     return arr
 end
 
--- pick newest: scan from bottom up, take first valid & not tried; also return bottomId
+-- ищем кандидата снизу-вверх; возвращаем it и bottomId
 local function pick_newest(lines, minProfitM, lastSeenId)
     local bottomLine = lines[#lines]
     local bottomId = bottomLine and parse_uuid_anywhere(bottomLine) or nil
+    if bottomId then log("bottomId="..bottomId) else log("bottomId=nil") end
+    if lastSeenId then log("lastSeenId="..lastSeenId) else log("lastSeenId=nil") end
 
-    -- если нижняя та же, что уже видели — ничего нового
+    -- если нижний тот же, что уже успешно обработан — ждём обновы
     if bottomId and lastSeenId and bottomId == lastSeenId then
         return nil, bottomId
     end
 
     for i = #lines, 1, -1 do
         local it = parse_line(lines[i])
-        if it and it.cur < it.max and it.profitM >= minProfitM and it.jobId ~= lastSeenId and not triedJob[it.jobId] then
-            return it, bottomId
+        if it then
+            if it.profitM >= minProfitM and it.cur < it.max then
+                if not triedJob[it.jobId] then
+                    return it, bottomId
+                end
+            end
         end
     end
     return nil, bottomId
@@ -256,22 +262,19 @@ local function run_loop()
 
         if body and #body>0 then
             local lines = split_lines(body)
-            local topPreview = lines[1] or "<empty>"
+            local topPreview    = lines[1] or "<empty>"
             local bottomPreview = lines[#lines] or "<empty>"
             local feedSig = tostring(#body).."|"..(topPreview).."#"..(bottomPreview)
 
-            -- если фид явно обновился — чистим только попытки (не lastSeenId)
             if feedSig ~= lastFeedSig then
-                triedJob = {}
+                triedJob = {}          -- позволяем ещё раз попробовать новый низ
                 lastFeedSig = feedSig
             end
 
             log(("feed lines=%d | top='%s' | bottom='%s'"):format(#lines, topPreview:sub(1,70), bottomPreview:sub(1,70)))
 
             local cand, bottomId = pick_newest(lines, Settings.minProfitM, Settings.lastSeenId)
-
             if not cand then
-                -- если нижний id тот же — ждём новых строк
                 if bottomId and Settings.lastSeenId and bottomId == Settings.lastSeenId then
                     statusLbl.Text = "waiting for new bottom…"
                 else
@@ -279,21 +282,20 @@ local function run_loop()
                 end
                 task.wait(0.8)
             else
-                -- помечаем, что этот bottom/кандидат обработан — чтобы не повторять
                 triedJob[cand.jobId] = true
-                Settings.lastSeenId = cand.jobId
-                persist()
-
                 local msg = ("join (BOTTOM-new) %s | %.2fM/s | %d/%d | %s"):format(
                     cand.name or "?", cand.profitM or 0, cand.cur or 0, cand.max or 0, cand.jobId)
                 statusLbl.Text = msg; log(msg)
 
                 local ok, tries = attempt_join(cand.jobId)
                 if ok then
-                    log("TELEPORT STARTED ✔ (tries: "..tries..")")
+                    -- ✅ помечаем как увиденный ТОЛЬКО ПОСЛЕ успешного старта
+                    Settings.lastSeenId = cand.jobId
+                    persist()
+                    log("TELEPORT STARTED ✔ (tries: "..tries..") | lastSeenId set")
                     setStarted(false); statusLbl.Text="teleporting…"; joining=false; return
                 else
-                    log("server full? retry limit reached ("..tries..") — waiting newer bottom")
+                    log("server full? retry limit reached ("..tries..") — wait newer bottom")
                 end
                 task.wait(0.7)
             end
@@ -306,7 +308,6 @@ local function run_loop()
     joining=false
 end
 
--- MAIN
 task.spawn(function()
     log("script loaded; started=OFF; place="..tostring(game.PlaceId).."; PLACE_ID="..tostring(PLACE_ID))
     if Settings.lastSeenId then log("remembered lastSeenId="..Settings.lastSeenId) end
