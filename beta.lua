@@ -1,46 +1,45 @@
--- FLOPPA AUTO JOIN — newest at TOP, minimal UI/UX, “finding/stopped” statuses
+-- FLOPPA LAST-LINE AJ — newest is BOTTOM line
 local PLACE_ID      = 109983668079237
 local FEED_URL      = "https://server-eta-two-29.vercel.app/api/feed?limit=200"
-local SETTINGS_FILE = "floppa_autojoin_prefs.json"
+local SETTINGS_FILE = "floppa_lastline_prefs.json"
 
 local HttpService     = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 local Players         = game:GetService("Players")
-local Lighting        = game:GetService("Lighting")
+local TweenService    = game:GetService("TweenService")
 local LP              = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
--- ============ logging ============
+-- ---------- utils ----------
 local function ts() return os.date("!%H:%M:%S").."Z" end
-local function log(s)  print("["..ts().."] "..tostring(s)) end
-local function warnf(s) warn("["..ts().."] "..tostring(s)) end
-
--- ============ FS ============
+local function print_retry(i, jid) print(("["..ts().."] retry %d/65 (server full?) %s"):format(i, tostring(jid))) end
 local function hasfs() return isfile and writefile and readfile end
 local function readf(p) local ok,d=pcall(function() return readfile(p) end); return ok and d or nil end
 local function writef(p,c) pcall(function() writefile(p,c) end) end
+local function trim(s) return (s:gsub("^%s+",""):gsub("%s+$","")) end
+local function clean(s) return (s:gsub("%*%*",""):gsub("\226\128\139","")) end
 
--- user settings (START всегда OFF)
-local S = { minProfitM=1, started=false, lastSeenId="" }
+-- ---------- settings ----------
+local S = { started=false, minProfitM=1, lastSeenBottomId="" } -- START по умолчанию OFF
 if hasfs() and isfile(SETTINGS_FILE) then
     local raw=readf(SETTINGS_FILE)
     if raw then
         local ok,t=pcall(function() return HttpService:JSONDecode(raw) end)
         if ok and typeof(t)=="table" then
             if tonumber(t.minProfitM) then S.minProfitM=tonumber(t.minProfitM) end
-            if type(t.lastSeenId)=="string" then S.lastSeenId=t.lastSeenId end
+            if type(t.lastSeenBottomId)=="string" then S.lastSeenBottomId=t.lastSeenBottomId end
         end
     end
 end
 local function persist()
     if hasfs() then
         writef(SETTINGS_FILE, HttpService:JSONEncode({
-            minProfitM=S.minProfitM, lastSeenId=S.lastSeenId or "", started=false
+            started=false, minProfitM=S.minProfitM, lastSeenBottomId=S.lastSeenBottomId or ""
         }))
     end
 end
 persist()
 
--- ============ HTTP (cache-buster) ============
+-- ---------- HTTP (cache-buster) ----------
 local function http_get(u)
     local url = ("%s&t=%d"):format(u, math.floor(os.clock()*1000)%2147483647)
     local H = { ["accept"]="text/plain", ["cache-control"]="no-cache", ["pragma"]="no-cache" }
@@ -58,10 +57,8 @@ local function http_get(u)
     return nil
 end
 
--- ============ parsing ============
+-- ---------- parsing ----------
 local MULT={K=1/1000,M=1,B=1000,T=1e6}
-local function trim(s) return (s:gsub("^%s+",""):gsub("%s+$","")) end
-local function clean(s) return (s:gsub("%*%*",""):gsub("\226\128\139","")) end
 local function uuid(s) return (s:match("([%x][%x][%x][%x][%x][%x][%x][%x]%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x)")) end
 local function profit(line)
     local L=line:lower()
@@ -90,209 +87,183 @@ local function split_lines(body)
     local t={} for s in string.gmatch(body,"[^\r\n]+") do s=trim(s); if #s>0 then t[#t+1]=s end end; return t
 end
 
--- ============ pretty UI (frosted) ============
-local gui=Instance.new("ScreenGui"); gui.Name="FLOPPA_AUTO_JOIN"; gui.ResetOnSpawn=false
+-- ---------- UI (как на скрине) ----------
+local gui=Instance.new("ScreenGui"); gui.Name="FLOPPA_LAST_LINE_AJ"; gui.ResetOnSpawn=false
 pcall(function()
     if syn and syn.protect_gui then syn.protect_gui(gui) end
     gui.Parent=(gethui and gethui()) or game:GetService("CoreGui")
 end)
 if not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
 
--- лёгкий глобальный блюр (мягкий, чтобы не мешал)
-local blur = Instance.new("BlurEffect")
-blur.Enabled = true
-blur.Size = 6
-blur.Name = "FloppaUIBlur"
-blur.Parent = Lighting
-
--- “фрост”-карточка
-local root = Instance.new("Frame", gui)
-root.Name="Card"
-root.Size = UDim2.fromOffset(380,190)
-root.Position = UDim2.new(0,20,0,100)
-root.BackgroundTransparency = 0.25
-root.BackgroundColor3 = Color3.fromRGB(22,24,28)
-root.BorderSizePixel=0
-root.Active=true; root.Draggable=true
-
-local corner = Instance.new("UICorner", root); corner.CornerRadius = UDim.new(0,16)
-local stroke = Instance.new("UIStroke", root); stroke.Thickness=1.2; stroke.Color=Color3.fromRGB(80,90,105); stroke.Transparency=0.35
-local grad = Instance.new("UIGradient", root)
-grad.Color = ColorSequence.new{
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(255,255,255)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(180,180,190))
+local C = {
+    cardBG = Color3.fromRGB(28,31,36),
+    title  = Color3.fromRGB(236,239,244),
+    text   = Color3.fromRGB(180,186,196),
+    inputBG= Color3.fromRGB(18,21,25),
+    btnOn  = Color3.fromRGB(46,204,113),
+    btnOff = Color3.fromRGB(72,76,82),
+    stroke = Color3.fromRGB(70,78,92),
 }
-grad.Transparency = NumberSequence.new{
-    NumberSequenceKeypoint.new(0, 0.85),
-    NumberSequenceKeypoint.new(1, 0.90)
-}
-grad.Rotation = 90
 
--- мягкая тень (ImageLabel)
-local shadow = Instance.new("ImageLabel", root)
-shadow.ZIndex = 0
-shadow.Position = UDim2.new(0, -20, 0, -20)
-shadow.Size = UDim2.new(1, 40, 1, 40)
-shadow.BackgroundTransparency = 1
-shadow.Image = "rbxassetid://1316045217"
-shadow.ImageTransparency = 0.55
-shadow.ScaleType = Enum.ScaleType.Slice
-shadow.SliceCenter = Rect.new(10, 10, 118, 118)
+local card=Instance.new("Frame",gui)
+card.Size=UDim2.fromOffset(285,150)         -- компактная карточка как на фото
+card.Position=UDim2.new(0,20,0,80)
+card.BackgroundColor3=C.cardBG
+card.BackgroundTransparency=0.05
+card.BorderSizePixel=0
+card.Active=true; card.Draggable=true
+local cardCorner=Instance.new("UICorner",card); cardCorner.CornerRadius=UDim.new(0,10)
+local cardStroke=Instance.new("UIStroke",card); cardStroke.Color=C.stroke; cardStroke.Thickness=1; cardStroke.Transparency=0.4
 
-local title = Instance.new("TextLabel", root)
-title.Size=UDim2.new(1,-20,0,26); title.Position=UDim2.new(0,12,0,10)
-title.BackgroundTransparency=1; title.Font=Enum.Font.GothamBold; title.TextSize=18
-title.TextXAlignment=Enum.TextXAlignment.Left
-title.TextColor3=Color3.fromRGB(230,233,240)
+local title=Instance.new("TextLabel",card)
+title.Position=UDim2.new(0,12,0,8); title.Size=UDim2.new(1,-24,0,20)
+title.BackgroundTransparency=1; title.Font=Enum.Font.GothamBold; title.TextSize=16
+title.TextXAlignment=Enum.TextXAlignment.Left; title.TextColor3=C.title
 title.Text="FLOPPA AUTO JOIN"
 
-local lbl=Instance.new("TextLabel", root)
-lbl.Position=UDim2.new(0,12,0,48); lbl.Size=UDim2.new(0,150,0,22)
-lbl.BackgroundTransparency=1; lbl.Font=Enum.Font.Gotham; lbl.TextSize=14
-lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.TextColor3=Color3.fromRGB(190,196,206)
-lbl.Text="Min profit (M/s):"
+local lab=Instance.new("TextLabel",card)
+lab.Position=UDim2.new(0,12,0,34); lab.Size=UDim2.new(0,140,0,18)
+lab.BackgroundTransparency=1; lab.Font=Enum.Font.Gotham; lab.TextSize=13
+lab.TextXAlignment=Enum.TextXAlignment.Left; lab.TextColor3=C.text
+lab.Text="Min profit (M/s):"
 
-local input=Instance.new("TextBox", root)
-input.Position=UDim2.new(0,160,0,46); input.Size=UDim2.new(0,80,0,26)
-input.BackgroundColor3=Color3.fromRGB(18,21,25); input.Text=tostring(S.minProfitM)
-input.TextColor3=Color3.fromRGB(235,235,240); input.ClearTextOnFocus=false
-input.Font=Enum.Font.Gotham; input.TextSize=14
-Instance.new("UICorner", input).CornerRadius = UDim.new(0,8)
-local inputStroke = Instance.new("UIStroke", input); inputStroke.Thickness=1; inputStroke.Color=Color3.fromRGB(70,80,95); inputStroke.Transparency=0.35
+local input=Instance.new("TextBox",card)
+input.Position=UDim2.new(0,12,0,54); input.Size=UDim2.new(1,-24,0,26)
+input.BackgroundColor3=C.inputBG; input.Text=tostring(S.minProfitM)
+input.TextScaled=true; input.ClearTextOnFocus=false; input.Font=Enum.Font.GothamSemibold
+input.TextColor3=Color3.fromRGB(230,230,230)
+local iCorner=Instance.new("UICorner",input); iCorner.CornerRadius=UDim.new(0,8)
+local iStroke=Instance.new("UIStroke",input); iStroke.Color=C.stroke; iStroke.Transparency=0.35
 
-local btn=Instance.new("TextButton", root)
-btn.Position=UDim2.new(0,12,0,82); btn.Size=UDim2.new(1,-24,0,36)
-btn.BackgroundColor3=Color3.fromRGB(46,204,113); btn.Text="START"
-btn.TextColor3=Color3.fromRGB(10,10,10); btn.Font=Enum.Font.GothamBold; btn.TextSize=16
-Instance.new("UICorner", btn).CornerRadius = UDim.new(0,10)
+local btn=Instance.new("TextButton",card)
+btn.Position=UDim2.new(0,12,0,86); btn.Size=UDim2.new(1,-24,0,30)
+btn.BackgroundColor3=C.btnOn; btn.Text="START"; btn.TextColor3=Color3.fromRGB(10,10,10)
+btn.Font=Enum.Font.GothamBold; btn.TextSize=16
+local bCorner=Instance.new("UICorner",btn); bCorner.CornerRadius=UDim.new(0,10)
 
-local status=Instance.new("TextLabel", root)
-status.Position=UDim2.new(0,12,0,126); status.Size=UDim2.new(1,-24,0,50)
-status.BackgroundTransparency=1; status.Font=Enum.Font.Gotham; status.TextSize=13
-status.TextColor3=Color3.fromRGB(200,205,215); status.TextWrapped=true
-status.TextXAlignment=Enum.TextXAlignment.Left; status.Text="stopped"
+-- строка статуса снизу (как на фото)
+local statusLbl=Instance.new("TextLabel",card)
+statusLbl.Position=UDim2.new(0,12,1,-22); statusLbl.Size=UDim2.new(1,-24,0,16)
+statusLbl.BackgroundTransparency=1; statusLbl.Font=Enum.Font.Gotham; statusLbl.TextSize=12
+statusLbl.TextXAlignment=Enum.TextXAlignment.Left; statusLbl.TextColor3=C.text
+statusLbl.Text="stopped"
 
--- ============ START/STOP ============
+-- строка joining прямо под заголовком
+local joiningLbl=Instance.new("TextLabel",card)
+joiningLbl.Position=UDim2.new(0,12,0,24); joiningLbl.Size=UDim2.new(1,-24,0,14)
+joiningLbl.BackgroundTransparency=1; joiningLbl.Font=Enum.Font.Gotham; joiningLbl.TextSize=12
+joiningLbl.TextXAlignment=Enum.TextXAlignment.Left; joiningLbl.TextColor3=Color3.fromRGB(205,210,220)
+joiningLbl.Text = "joining: —"
+
+-- ---------- auto-inject ----------
+do
+  local loader=[[loadstring(game:HttpGet("https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/beta.lua"))()]]
+  if queue_on_teleport then pcall(function() queue_on_teleport(loader) end)
+  elseif syn and syn.queue_on_teleport then pcall(function() syn.queue_on_teleport(loader) end) end
+end
+
+-- ---------- teleport ----------
+local function attempt_join(jobId)
+    local tpState=nil
+    local onTp = LP.OnTeleport and LP.OnTeleport:Connect(function(st) tpState=st end)
+    local onFail = TeleportService.TeleportInitFailed:Connect(function(player, _pid, _jid, _err)
+        if player==LP then tpState = tpState or Enum.TeleportState.Failed end
+    end)
+
+    local tries, started = 0, false
+    while tries < 65 and not started and S.started do
+        tries += 1
+        local ok,err=pcall(function()
+            TeleportService:TeleportToPlaceInstance(PLACE_ID, jobId, LP)
+        end)
+        -- ждём начала
+        local t=0
+        while t<1.2 and S.started do
+            if tpState==Enum.TeleportState.Started or tpState==Enum.TeleportState.InProgress then started=true; break end
+            task.wait(0.06); t+=0.06
+        end
+        if not started and S.started then
+            print_retry(tries, jobId) -- <<< единственные логи в консоль
+            task.wait(0.1) -- 10/сек
+        end
+    end
+
+    if onTp then onTp:Disconnect() end
+    if onFail then onFail:Disconnect() end
+    return started, tries
+end
+
+-- ---------- helpers ----------
 local joining=false
-local debounce=false
-local lastSig=""
-
 local function setStarted(on)
     S.started = on and true or false
     btn.Text = S.started and "STOP" or "START"
-    btn.BackgroundColor3 = S.started and Color3.fromRGB(46,204,113) or Color3.fromRGB(90,90,90)
-    joining=false; lastSig=""
+    btn.BackgroundColor3 = S.started and C.btnOn or C.btnOff
+    statusLbl.Text = S.started and "finding" or "stopped"
+    joining=false
+    joiningLbl.Text = "joining: —"
     persist()
-    status.Text = S.started and "finding" or "stopped"
-    log("state -> "..(S.started and "STARTED" or "STOPPED"))
 end
 setStarted(false)
 
 btn.Activated:Connect(function()
-    if debounce then return end; debounce=true
     setStarted(not S.started)
-    task.delay(0.25,function() debounce=false end)
 end)
 
 input:GetPropertyChangedSignal("Text"):Connect(function()
-    local v=tonumber(input.Text); if v and v>=0 then S.minProfitM=v; persist(); log("minProfitM -> "..v) end
+    local v=tonumber(input.Text); if v and v>=0 then S.minProfitM=v; persist() end
 end)
 
--- ============ auto-inject ============
-do
-  local loader=[[loadstring(game:HttpGet("https://raw.githubusercontent.com/windyx12193/Floppa/refs/heads/main/beta.lua"))()]]
-  local ok=false
-  if queue_on_teleport then pcall(function() queue_on_teleport(loader); ok=true end)
-  elseif syn and syn.queue_on_teleport then pcall(function() syn.queue_on_teleport(loader); ok=true end) end
-  log("queue_on_teleport set: "..tostring(ok))
-end
-
--- ============ teleport ============
-local function attempt_join(jobId)
-    local lp=LP; local tries, tpState = 0, nil; local started=false
-    local tpConn = lp.OnTeleport and lp.OnTeleport:Connect(function(st) tpState=st end)
-    local failConn = TeleportService.TeleportInitFailed:Connect(function(player, _pid, _jid, err)
-        if player==lp then warnf("TeleportInitFailed: "..tostring(err)) end
-    end)
-    while tries<65 and not started and S.started do
-        tries += 1
-        local ok,err=pcall(function() TeleportService:TeleportToPlaceInstance(PLACE_ID, jobId, lp) end)
-        if not ok then warnf("Teleport error: "..tostring(err)) end
-        local t=0
-        while t<3 and S.started do
-            if tpState==Enum.TeleportState.Started or tpState==Enum.TeleportState.InProgress then started=true; break end
-            task.wait(0.05); t+=0.05
-        end
-        if not started and S.started then task.wait(0.1) end -- 10/сек
-    end
-    if tpConn then tpConn:Disconnect() end
-    if failConn then failConn:Disconnect() end
-    return started, tries
-end
-
--- ============ helpers ============
-local function pick_top(lines)
+local function pick_bottom(lines)
     if #lines==0 then return nil,nil,nil end
-    local line = lines[1]
-    local id = uuid(line or "")
-    local it = line and parse_line(line) or nil
-    return it, id, line, 1
+    local line = lines[#lines]
+    local id   = uuid(line or "")
+    local it   = line and parse_line(line) or nil
+    return it, id, line
 end
 
-local function lines_from(body)
-    local t={} for s in string.gmatch(body,"[^\r\n]+") do s=trim(s); if #s>0 then t[#t+1]=s end end; return t
-end
-
--- ============ loop ============
+-- ---------- loop ----------
 local function run_loop()
     if joining or not S.started then return end
     joining=true
     while S.started do
-        status.Text="finding"
-        local body=http_get(FEED_URL)
+        local body = http_get(FEED_URL)
         if not body or #body==0 then
-            task.wait(0.5) -- короткий бэк-офф; статус остаётся "finding"
+            statusLbl.Text = "fetch error / empty"
+            task.wait(0.8)
         else
-            local lines=lines_from(body)
-            local it, id, preview, idx = pick_top(lines)
-            local sig = tostring(#lines).."|"..tostring(id)
-            if sig ~= lastSig then
-                lastSig=sig
-                -- лаконичный лог
-                log(("top=%s | line='%s'"):format(tostring(id or "?"):sub(1,8), (preview or ""):sub(1,64)))
-            end
-
+            local lines = split_lines(body)
+            local it, id = pick_bottom(lines)
             if not id then
-                task.wait(0.4) -- “finding”
-            elseif id == S.lastSeenId then
-                -- тот же верх — просто продолжаем “finding”, без спама
+                statusLbl.Text = "parse error"
+                task.wait(0.5)
+            elseif id == S.lastSeenBottomId then
+                statusLbl.Text = "finding"
                 task.wait(0.35)
             else
-                -- новый верх — сохраняем и пробуем
-                S.lastSeenId=id; persist()
-                if it and it.cur<it.max and it.profitM >= S.minProfitM then
-                    local msg=("JOIN %s | %.1fM/s | %d/%d | %s"):format(it.name or "?", it.profitM, it.cur, it.max, it.jobId)
-                    log(msg)
+                S.lastSeenBottomId = id; persist()
+                if it and it.cur < it.max and it.profitM >= S.minProfitM then
+                    joiningLbl.Text = ("joining: %s | %.1f M/s"):format(it.name or "?", it.profitM or 0)
+                    statusLbl.Text = "joining…"
                     local ok, tries = attempt_join(it.jobId)
                     if ok then
-                        log("TELEPORT STARTED ✔ (tries: "..tries..")")
-                        setStarted(false) -- автостоп; автоинжект загрузит на новом сервере
+                        setStarted(false)     -- остановка; на новом сервере автозагрузится
                         joining=false
                         return
                     else
-                        log("join failed after "..tries.." tries — waiting next")
+                        statusLbl.Text = "finding"
                     end
+                else
+                    statusLbl.Text = "finding"
+                    task.wait(0.45)
                 end
-                task.wait(0.45)
             end
         end
     end
-    status.Text="stopped"
     joining=false
 end
 
 task.spawn(function()
-    log("script loaded; place="..tostring(game.PlaceId).."; PLACE_ID="..PLACE_ID)
     while task.wait(0.3) do
         if S.started and not joining then run_loop() end
     end
