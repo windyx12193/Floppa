@@ -1,4 +1,4 @@
--- FLOPPA AJ (TOP only, light) — newest from TOP, fast retries (~30/s)
+-- FLOPPA AJ (TOP, anti-freeze) — fast retries, minimal UI work
 local PLACE_ID      = 109983668079237
 local FEED_URL      = "https://server-eta-two-29.vercel.app/api/feed?limit=200"
 local SETTINGS_FILE = "floppa_top_prefs.json"
@@ -8,15 +8,15 @@ local TeleportService = game:GetService("TeleportService")
 local Players         = game:GetService("Players")
 local LP              = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
--- ========== filesystem ==========
+-- ========== FS ==========
 local function hasfs() return isfile and writefile and readfile end
 local function readf(p) local ok,d=pcall(function() return readfile(p) end); return ok and d or nil end
 local function writef(p,c) pcall(function() writefile(p,c) end) end
 
--- ========== settings (START OFF, TOP по дефолту) ==========
+-- ========== Settings (START OFF) ==========
 local S = { started=false, minProfitM=1, lastTopId="" }
-if hasfs() and isfile(SETTINGS_FILE) then
-    local raw=readf(SETTINGS_FILE)
+do
+    local raw = hasfs() and isfile(SETTINGS_FILE) and readf(SETTINGS_FILE) or nil
     if raw then
         local ok,t=pcall(function() return HttpService:JSONDecode(raw) end)
         if ok and typeof(t)=="table" then
@@ -26,11 +26,10 @@ if hasfs() and isfile(SETTINGS_FILE) then
     end
 end
 local function persist()
-    if hasfs() then
-        writef(SETTINGS_FILE, HttpService:JSONEncode({
-            started=false, minProfitM=S.minProfitM, lastTopId=S.lastTopId or ""
-        }))
-    end
+    if not hasfs() then return end
+    writef(SETTINGS_FILE, HttpService:JSONEncode({
+        started=false, minProfitM=S.minProfitM, lastTopId=S.lastTopId or ""
+    }))
 end
 persist()
 
@@ -51,52 +50,47 @@ local function http_get(u)
     return nil
 end
 
--- ========== parsing ==========
+-- ========== parsing (TOP only, без аллокаций) ==========
 local MULT={K=1/1000,M=1,B=1000,T=1e6}
 local function trim(s) return (s:gsub("^%s+",""):gsub("%s+$","")) end
 local function clean(s) return (s:gsub("%*%*",""):gsub("\226\128\139","")) end
-local function uuid(s) return (s and s:match("([%x][%x][%x][%x][%x][%x][%x][%x]%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x)")) end
+local function first_line(body) return body:match("([^\r\n]+)") end
+local function uuid(s) return s and s:match("([%x][%x][%x][%x][%x][%x][%x][%x]%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x)") end
 local function profitM(line)
     local L=line:lower()
-    for _,p in ipairs({
-        "%$%s*([%d%.]+)%s*([kmbt]?)%s*/%s*s",
-        "%%?%$%s*([%d%.]+)%s*([kmbt]?)%s*&%#x2f;?%s*s",
-        "%$%s*([%d%.]+)%s*([kmbt]?)%s*\\%s*s",
-        "%$%s*([%d%.]+)%s*([kmbt]?)%s+s",
-    }) do
-        local i,_,num,suf=L:find(p)
-        if i then local n=tonumber(num or "0") or 0; return n*(MULT[(suf or ""):upper()] or 1) end
-    end
+    local _,_,num,suf = L:find("%$%s*([%d%.]+)%s*([kmbt]?)%s*/%s*s")
+    if not num then _,_,num,suf = L:find("%%?%$%s*([%d%.]+)%s*([kmbt]?)%s*&%#x2f;?%s*s") end
+    if not num then _,_,num,suf = L:find("%$%s*([%d%.]+)%s*([kmbt]?)%s*\\%s*s") end
+    if not num then _,_,num,suf = L:find("%$%s*([%d%.]+)%s*([kmbt]?)%s+s") end
+    if not num then return nil end
+    local n=tonumber(num or "0") or 0
+    return n*(MULT[(suf or ""):upper()] or 1)
 end
 local function players(line)
     local c,m=line:match("(%d+)%s*/%s*(%d+)")
-    if not c then local c2,m2=line:match("(%d+)%s*[%x\2044/\\]+%s*(%d+)"); if c2 then return tonumber(c2), tonumber(m2) end end
+    if not c then
+        local c2,m2=line:match("(%d+)%s*[%x\2044/\\]+%s*(%d+)")
+        if c2 then return tonumber(c2), tonumber(m2) end
+    end
     return c and tonumber(c), m and tonumber(m)
 end
 local function name_of(line)
     local f=line:match("^([^|]+)|") or line
     return trim(clean(f or ""))
 end
-
-local function first_line(body)
-    for s in string.gmatch(body,"[^\r\n]+") do
-        local t=trim(s); if #t>0 then return t end
-    end
-end
-
 local function parse_top(body)
     local line = first_line(body)
     if not line then return nil,nil end
-    line=clean(line)
-    local id=uuid(line); if not id then return nil,nil end
-    local pM=profitM(line); local c,m=players(line); local nm=name_of(line)
+    line = clean(line)
+    local id = uuid(line); if not id then return nil,nil end
+    local pM = profitM(line); local c,m = players(line); local nm = name_of(line)
     if not (pM and c and m) then return nil,id end
     return {jobId=id, profitM=pM, cur=c, max=m, name=nm, line=line}, id
 end
 
--- ========== UI (как на твоём скрине) ==========
+-- ========== UI (минимум перерисовок) ==========
 local gui=Instance.new("ScreenGui")
-gui.Name="FLOPPA_AJ_TOP"
+gui.Name="FLOPPA_AJ_TOP_AF"
 gui.ResetOnSpawn=false
 pcall(function()
     if syn and syn.protect_gui then syn.protect_gui(gui) end
@@ -133,7 +127,10 @@ local joiningLbl=Instance.new("TextLabel",card)
 joiningLbl.Position=UDim2.new(0,12,0,24); joiningLbl.Size=UDim2.new(1,-24,0,14)
 joiningLbl.BackgroundTransparency=1; joiningLbl.Font=Enum.Font.Gotham; joiningLbl.TextSize=12
 joiningLbl.TextXAlignment=Enum.TextXAlignment.Left; joiningLbl.TextColor3=Color3.fromRGB(205,210,220)
-joiningLbl.Text="joining: —"
+joiningLbl.Text="joining: —"; local joiningPrev = joiningLbl.Text
+local function setJoining(t)
+    if t ~= joiningPrev then joiningPrev=t; joiningLbl.Text=t end
+end
 
 local lab=Instance.new("TextLabel",card)
 lab.Position=UDim2.new(0,12,0,40); lab.Size=UDim2.new(0,140,0,18)
@@ -158,7 +155,10 @@ local statusLbl=Instance.new("TextLabel",card)
 statusLbl.Position=UDim2.new(0,12,1,-22); statusLbl.Size=UDim2.new(1,-24,0,16)
 statusLbl.BackgroundTransparency=1; statusLbl.Font=Enum.Font.Gotham; statusLbl.TextSize=12
 statusLbl.TextXAlignment=Enum.TextXAlignment.Left; statusLbl.TextColor3=C.text
-statusLbl.Text="stopped"
+statusLbl.Text="stopped"; local statusPrev=statusLbl.Text
+local function setStatus(t)
+    if t~=statusPrev then statusPrev=t; statusLbl.Text=t end
+end
 
 -- ========== auto-inject ==========
 do
@@ -167,35 +167,32 @@ do
   elseif syn and syn.queue_on_teleport then pcall(function() syn.queue_on_teleport(loader) end) end
 end
 
--- ========== teleport (ускоренные повторы) ==========
--- Было ~10/сек (delay ~0.10), стало ~30/сек (delay ~0.033) + более короткое окно ожидания.
-local RETRY_SLEEP = 0.033     -- 30 попыток/сек
-local STATE_STEP  = 0.02      -- опрос состояния телепорта
-local STATE_WIN   = 0.60      -- окно ожидания «стартанул телепорт» (раньше 1.2)
-
+-- ========== teleport (fast but light) ==========
+-- 30/с попытки, но лог в консоль не чаще, чем раз в 0.5 c
+local RETRY_SLEEP = 0.033
+local STATE_STEP  = 0.02
+local STATE_WIN   = 0.60
 local function attempt_join(jobId)
     local tpState=nil
+    local lastLog=0
     local onTp = LP.OnTeleport and LP.OnTeleport:Connect(function(st) tpState=st end)
     local onFail = TeleportService.TeleportInitFailed:Connect(function(player, _pid, _jid, _err)
         if player==LP then tpState = tpState or Enum.TeleportState.Failed end
     end)
-
     local tries, started = 0, false
+
     while tries < 65 and not started and S.started do
         tries += 1
-        pcall(function()
-            TeleportService:TeleportToPlaceInstance(PLACE_ID, jobId, LP)
-        end)
-        -- более частая проверка статуса и меньшее окно
+        pcall(function() TeleportService:TeleportToPlaceInstance(PLACE_ID, jobId, LP) end)
         local t=0
         while t<STATE_WIN and S.started do
-            if tpState==Enum.TeleportState.Started or tpState==Enum.TeleportState.InProgress then
-                started=true; break
-            end
+            if tpState==Enum.TeleportState.Started or tpState==Enum.TeleportState.InProgress then started=true; break end
             task.wait(STATE_STEP); t+=STATE_STEP
         end
         if not started and S.started then
-            print(("retry %d/65 (server full?) %s"):format(tries, jobId))
+            if os.clock() - lastLog > 0.5 then
+                lastLog=os.clock(); print(("retry %d/65 (server full?) %s"):format(tries, jobId))
+            end
             task.wait(RETRY_SLEEP)
         end
     end
@@ -206,14 +203,13 @@ local function attempt_join(jobId)
 end
 
 -- ========== start/stop ==========
-local joining=false
+local busy=false
 local function setStarted(on)
     S.started = on and true or false
     btn.Text = S.started and "STOP" or "START"
     btn.BackgroundColor3 = S.started and C.btnOn or C.btnOff
-    statusLbl.Text = S.started and "finding" or "stopped"
-    joining=false
-    joiningLbl.Text="joining: —"
+    setStatus(S.started and "finding" or "stopped")
+    busy=false; setJoining("joining: —")
     persist()
 end
 setStarted(false)
@@ -223,44 +219,46 @@ input:GetPropertyChangedSignal("Text"):Connect(function()
     local v=tonumber(input.Text); if v and v>=0 then S.minProfitM=v; persist() end
 end)
 
--- ========== main loop (TOP only) ==========
+-- ========== loop (TOP only, с анти-фриз тактом) ==========
 local function run_loop()
-    if joining or not S.started then return end
-    joining=true
-    while S.started do
-        local body = http_get(FEED_URL)
-        if not body or #body==0 then
-            statusLbl.Text="fetch error / empty"; task.wait(0.7)
-        else
-            local it, id = parse_top(body)  -- берём TOP
-            if not id then
-                statusLbl.Text="parse error"; task.wait(0.5)
-            elseif id == S.lastTopId then
-                statusLbl.Text="finding"; task.wait(0.5)
+    if busy or not S.started then return end
+    busy=true
+    task.spawn(function()
+        while S.started do
+            local body = http_get(FEED_URL)
+            if not body or #body==0 then
+                setStatus("fetch error / empty"); task.wait(0.65)
             else
-                S.lastTopId = id; persist()
-                if it and it.cur < it.max and it.profitM >= S.minProfitM then
-                    joiningLbl.Text = ("joining: %s | %.1f M/s"):format(it.name or "?", it.profitM or 0)
-                    statusLbl.Text = "joining…"
-                    local ok = attempt_join(it.jobId)
-                    if ok then
-                        setStarted(false) -- на новом сервере автоподгрузится
-                        joining=false
-                        return
-                    else
-                        statusLbl.Text="finding"
-                    end
+                local it, id = parse_top(body) -- TOP
+                if not id then
+                    setStatus("parse error"); task.wait(0.5)
+                elseif id == S.lastTopId then
+                    setStatus("finding"); task.wait(0.55)
                 else
-                    statusLbl.Text="finding"; task.wait(0.5)
+                    S.lastTopId = id; persist()
+                    if it and it.cur < it.max and it.profitM >= S.minProfitM then
+                        setJoining(("joining: %s | %.1f M/s"):format(it.name or "?", it.profitM or 0))
+                        setStatus("joining…")
+                        local ok = attempt_join(it.jobId)
+                        if ok then
+                            setStarted(false) -- автоподгрузится на новом сервере
+                            busy=false
+                            return
+                        else
+                            setStatus("finding")
+                        end
+                    else
+                        setStatus("finding"); task.wait(0.55)
+                    end
                 end
             end
         end
-    end
-    joining=false
+        busy=false
+    end)
 end
 
 task.spawn(function()
-    while task.wait(0.35) do
-        if S.started and not joining then run_loop() end
+    while task.wait(0.33) do
+        if S.started and not busy then run_loop() end
     end
 end)
