@@ -1,4 +1,4 @@
--- FLOPPA AUTO JOIN — ETag PULL ONLY (smooth, no WS)
+-- FLOPPA AUTO JOIN – ETag PULL ONLY (smooth, no WS) + 192-char hash support
 local PLACE_ID       = 109983668079237
 local FEED_URL       = "https://server-eta-two-29.vercel.app/api/feed?limit=120"
 local SETTINGS_FILE  = "floppa_pull_only.json"
@@ -43,6 +43,25 @@ local MULT={K=1/1000,M=1,B=1000,T=1e6}
 local function trim(s) return (s and s:gsub("^%s+",""):gsub("%s+$","")) or "" end
 local function clean(s) return (s or ""):gsub("%*%*",""):gsub("\226\128\139","") end
 
+-- NEW: Поддержка обоих форматов ID
+local function extract_id(s)
+  if not s then return nil end
+  
+  -- Стандартный UUID (8-4-4-4-12)
+  local uuid = s:match("([%x][%x][%x][%x][%x][%x][%x][%x]%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x)")
+  if uuid then return uuid end
+  
+  -- Длинный хеш (140-200 символов) - ищем все непрерывные hex последовательности
+  for hex_str in s:gmatch("([%x]+)") do
+    local len = #hex_str
+    if len >= 140 and len <= 200 then
+      return hex_str
+    end
+  end
+  
+  return nil
+end
+
 local function profitM(line)
   local L=(line or ""):lower()
   local _,_,num,suf = L:find("%$%s*([%d%.]+)%s*([kmbt]?)%s*/%s*s")
@@ -64,32 +83,28 @@ local function players(line)
 end
 
 local function name_of(line)
-  local f=(line or ""):match("^([^|]+)") or line
+  local f=(line or ""):match("^([^|]+)|") or line
   return trim(clean(f))
 end
 
--- jobId: последняя колонка после последнего '|', допускаем 8-4-4-4-12 или 192 hex
 local function parse_line(line)
-  line = line or ""
-  local cleanLine = clean(line)
-
-  local lastField = cleanLine:match(".*|(.*)")
-  local rawId = lastField and trim(lastField) or ""
-  if rawId == "" then return nil end
-
-  local id
-  if rawId:match("^[%x][%x][%x][%x][%x][%x][%x][%x]%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") then
-    id = rawId
-  elseif rawId:match("^[%x]+$") and #rawId == 192 then
-    id = rawId
+  local original_line = line or ""
+  line = clean(line or "")
+  
+  -- ВАЖНО: извлекаем ID из оригинальной строки, ДО очистки
+  local id = extract_id(original_line)
+  if not id then return nil end
+  
+  -- Debug: показываем тип найденного ID
+  if #id > 40 then
+    print(("[FLOPPA] Long hash detected: %s... (%d chars)"):format(id:sub(1,30), #id))
   else
-    return nil
+    print(("[FLOPPA] UUID detected: %s"):format(id))
   end
-
-  local pM = profitM(cleanLine)
-  local c,m = players(cleanLine)
-  local nm = name_of(cleanLine)
-
+  
+  local pM = profitM(line)
+  local c,m = players(line)
+  local nm = name_of(line)
   return { jobId=id, profitM=pM, cur=c, max=m, name=nm, line=line }
 end
 
@@ -137,8 +152,8 @@ local joiningLbl=Instance.new("TextLabel",card)
 joiningLbl.Position=UDim2.new(0,12,0,28); joiningLbl.Size=UDim2.new(1,-24,0,14)
 joiningLbl.BackgroundTransparency=1; joiningLbl.Font=Enum.Font.Gotham; joiningLbl.TextSize=12
 joiningLbl.TextXAlignment=Enum.TextXAlignment.Left; joiningLbl.TextColor3=Color3.fromRGB(205,210,220)
-joiningLbl.Text="joining: —"
-local _joinTxt="joining: —"
+joiningLbl.Text="joining: –"
+local _joinTxt="joining: –"
 local function setJoining(t) if t~=_joinTxt then _joinTxt=t; joiningLbl.Text=t end end
 
 local lab=Instance.new("TextLabel",card)
@@ -193,7 +208,10 @@ local function attempt_join(jobId)
       task.wait(STATE_STEP); t+=STATE_STEP
     end
     if not started and S.started then
-      if tries%5==0 then print(("retry %d/15 (server full?) %s"):format(tries, jobId)) end
+      if tries%20==0 then 
+        local id_display = #jobId > 40 and (jobId:sub(1,30).."...") or jobId
+        print(("retry %d/65 (server full?) %s"):format(tries, id_display)) 
+      end
       task.wait(RETRY_SLEEP)
     end
   end
@@ -221,8 +239,10 @@ end
 local function handle_item(it)
   if not it or not it.jobId then return end
   if it.jobId == (S.lastTopId or "") then return end
+  -- фильтры
   if it.cur and it.max and it.cur>=it.max then S.lastTopId=it.jobId; mark_dirty(); return end
   if it.profitM and it.profitM < S.minProfitM then S.lastTopId=it.jobId; mark_dirty(); return end
+  -- join
   setJoining(("joining: %s | %.1f M/s"):format(it.name or "?", it.profitM or 0))
   setStatus("joining…")
   local ok = attempt_join(it.jobId)
@@ -254,7 +274,7 @@ local function setStarted(on)
   S.started = on and true or false
   btn.Text = S.started and "STOP" or "START"
   btn.BackgroundColor3 = S.started and C.btnOn or C.btnOff
-  setJoining("joining: —")
+  setJoining("joining: –")
   if S.started then
     setStatus("waiting new…")
     start_pull()
